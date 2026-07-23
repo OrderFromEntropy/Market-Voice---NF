@@ -15,7 +15,7 @@ HOW TO RUN (IDLE, Python 3.12)
        (python-dotenv is optional; this script parses .env itself.)
     2. Make sure Ollama is running and your Gemma model is pulled:
          ollama list
-       If your model tag is not "gemma3n:e2b", edit OLLAMA_MODEL below.
+       If your model tag is not "gemma4:e2b", edit OLLAMA_MODEL below.
     3. Make sure the YouTube key is reachable (see YT_API_KEY resolution below).
     4. Open this file in IDLE and press F5 (Run). It runs every stage in order.
        To run a single stage, set STAGE below (or pass it on the command line:
@@ -179,7 +179,7 @@ SAMPLE_COMMENTS = [
 # ============================================================================
 # Your installed Ollama model tag. Run `ollama list` to confirm. The script
 # self-checks this on startup and prints your installed tags if it is missing.
-OLLAMA_MODEL = "gemma3n:e2b"
+OLLAMA_MODEL = "gemma4:e2b"
 OLLAMA_URL = "http://localhost:11434"
 
 # Paste your YouTube Data API key here to hard-wire it (optional). If left blank,

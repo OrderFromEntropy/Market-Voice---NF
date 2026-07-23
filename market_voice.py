@@ -266,8 +266,17 @@ def cached_get_json(url, headers=None, pace_seconds=0.0, params=None):
         log("    ! network error: %s" % e)
         return None, False
     if r.status_code != 200:
-        log("    ! HTTP %s for %s" % (r.status_code, full[:90]))
-        return {"__error__": r.status_code, "__body__": r.text[:400]}, False
+        # Surface the API's own reason (e.g. "commentsDisabled") without
+        # echoing the URL, which contains the API key.
+        reason = ""
+        try:
+            errs = r.json().get("error", {}).get("errors", [])
+            reason = errs[0].get("reason", "") if errs else ""
+        except Exception:
+            pass
+        who = "youtube" if "googleapis.com" in url else ("reddit" if "reddit.com" in url else url[:40])
+        log("    ! HTTP %s (%s) from %s" % (r.status_code, reason or "no-reason", who))
+        return {"__error__": r.status_code, "__reason__": reason, "__body__": r.text[:400]}, False
     try:
         data = r.json()
     except Exception:

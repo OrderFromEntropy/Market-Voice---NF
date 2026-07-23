@@ -625,6 +625,7 @@ def stage_corpus():
             "url": d.get("url", ""),
             "created_utc": d.get("created_utc", ""),
             "text": text,
+            "window": window_text(text),
             "brands_matched": "|".join(brands),
             "bucket": bucket,
             "attribute": "",
@@ -634,7 +635,7 @@ def stage_corpus():
         })
     df = pd.DataFrame(rows, columns=[
         "id", "source", "subreddit_or_video", "segment", "url", "created_utc",
-        "text", "brands_matched", "bucket", "attribute", "sentiment", "quotable", "model_raw"])
+        "text", "window", "brands_matched", "bucket", "attribute", "sentiment", "quotable", "model_raw"])
     df.to_csv(CORPUS_CSV, index=False)
     log("[corpus] wrote %s : %d documents" % (CORPUS_CSV, len(df)))
     log("[corpus] dropped -> short:%d dupe:%d bot:%d no-brand/token:%d"
@@ -672,7 +673,7 @@ def write_corpus_stats(df):
 
 
 # ============================================================================
-#  STAGE 3  DIFFERENTIAL WORD CLOUDS (log-odds w/ informative Dirichlet prior)
+#  TEXT PROCESSING -- windowing, tokenizing, n-grams (shared by Layers 2 & 3)
 # ============================================================================
 STOPWORDS = set("""
 a an the and or but if then than so as of to in on at for with without from by about into over
@@ -682,16 +683,21 @@ my your his their our not no yes just really very too also more most some any al
 like dont don't im i'm youre you're thats that's what which who whom whose when where why how there
 here out up down off out again once only own same such nor own too s t re ve ll d m o
 scope scopes rifle rifles gun guns thing things stuff good bad great nice pretty much lot lots
+i'll couldn didn don isn won
+definitely recently currently basically honestly literally probably
 """.split())
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9\-']+")
+# Domain abbreviations worth keeping despite the length-3 minimum.
+SHORT_KEEP = {"qd"}
 
 
 def tokenize(text):
+    """Lowercase, strip punctuation, minimum token length 3."""
     toks = []
     for t in TOKEN_RE.findall(text.lower()):
         t = t.strip("-'")
-        if len(t) < 3 and t not in ("qd", "rtz"):
+        if len(t) < 3 and t not in SHORT_KEEP:
             continue
         if t in STOPWORDS:
             continue
@@ -699,89 +705,292 @@ def tokenize(text):
     return toks
 
 
-def logodds_terms(group_counts, rest_counts, alpha0=1000.0, top=60):
-    """Monroe et al. 2008 log-odds with informative Dirichlet prior.
-    group vs rest; prior = alpha0 * (word freq in the pooled corpus)."""
+# --- Sentence windowing around brand mentions -------------------------------
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_ALL_ALIASES = sorted({a for al in BRANDS.values() for a in al}, key=len, reverse=True)
+ALIAS_RE = re.compile("|".join(
+    r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])" for a in _ALL_ALIASES))
+# Every token that is part of a brand or product name -- excluded from term tables.
+BRAND_TOKENS = set()
+for _al in BRANDS.values():
+    for _a in _al:
+        for _t in re.findall(r"[a-z0-9]+", _a.lower()):
+            BRAND_TOKENS.add(_t)
+
+
+def window_text(full):
+    """Keep only the sentence(s) containing a brand mention plus one sentence on
+    each side. Falls back to the whole text when there is nothing to split on or
+    no explicit mention (e.g. a one-line comment)."""
+    flat = full.replace("\n", " ").strip()
+    sents = [s for s in SENT_SPLIT.split(flat) if s.strip()]
+    if len(sents) <= 1:
+        return flat
+    keep = set()
+    for i, s in enumerate(sents):
+        if ALIAS_RE.search(s.lower()):
+            keep.update((i - 1, i, i + 1))
+    idx = [i for i in sorted(keep) if 0 <= i < len(sents)]
+    if not idx:
+        return flat
+    return " ".join(sents[i] for i in idx).strip()
+
+
+# --- n-grams and distinctive-term scoring -----------------------------------
+def ngrams(tokens, nmax=3):
+    grams = []
+    for n in range(1, nmax + 1):
+        for i in range(len(tokens) - n + 1):
+            grams.append(" ".join(tokens[i:i + n]))
+    return grams
+
+
+def _ok_term(term):
+    # drop any n-gram containing a brand/product token
+    return not any(t in BRAND_TOKENS for t in term.split())
+
+
+def distinctive_ngrams(group_docs, rest_docs, alpha0=1000.0, top=15, min_docs=3):
+    """group_docs / rest_docs: lists of token-lists (one per document).
+    Returns [(term, zscore, doc_count), ...] ranked by log-odds (Monroe et al.
+    2008, informative Dirichlet prior), keeping only unigram..trigram terms that
+    appear in >= min_docs group documents and are not brand/product names."""
+    group_tf, rest_tf, group_df = Counter(), Counter(), Counter()
+    for toks in group_docs:
+        grams = ngrams(toks)
+        group_tf.update(grams)
+        for g in set(grams):
+            group_df[g] += 1
+    for toks in rest_docs:
+        rest_tf.update(ngrams(toks))
+    cands = [t for t, dfc in group_df.items() if dfc >= min_docs and _ok_term(t)]
     pooled = Counter()
-    pooled.update(group_counts)
-    pooled.update(rest_counts)
-    total_pooled = sum(pooled.values()) or 1
-    n_g = sum(group_counts.values())
-    n_r = sum(rest_counts.values())
-    zscores = {}
-    for w, cnt in pooled.items():
-        a_w = alpha0 * (cnt / total_pooled)
-        y_g = group_counts.get(w, 0)
-        y_r = rest_counts.get(w, 0)
-        # guard against degenerate terms
-        num_g = y_g + a_w
-        num_r = y_r + a_w
+    pooled.update(group_tf)
+    pooled.update(rest_tf)
+    total = sum(pooled.values()) or 1
+    n_g = sum(group_tf.values())
+    n_r = sum(rest_tf.values())
+    scored = []
+    for t in cands:
+        a_w = alpha0 * (pooled[t] / total)
+        num_g = group_tf.get(t, 0) + a_w
+        num_r = rest_tf.get(t, 0) + a_w
         den_g = n_g + alpha0 - num_g
         den_r = n_r + alpha0 - num_r
         if den_g <= 0 or den_r <= 0:
             continue
         delta = math.log(num_g / den_g) - math.log(num_r / den_r)
-        var = 1.0 / num_g + 1.0 / num_r
-        z = delta / math.sqrt(var)
-        zscores[w] = z
-    # keep the terms most distinctive to the group (positive z)
-    ranked = sorted(((w, z) for w, z in zscores.items() if z > 0),
-                    key=lambda kv: kv[1], reverse=True)[:top]
-    return {w: z for w, z in ranked}
+        z = delta / math.sqrt(1.0 / num_g + 1.0 / num_r)
+        scored.append((t, z, group_df[t]))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top]
+
+
+def _doc_window(r):
+    w = str(r.get("window", "") or "").strip()
+    return w if w else str(r.get("text", ""))
+
+
+def _brands_of(r):
+    return [b for b in str(r["brands_matched"]).split("|") if b]
 
 
 def stage_clouds():
+    """Layer 2 -- distinctive-term tables (single-brand docs), a brand-by-brand
+    co-mention matrix (multi-brand docs), two targeted cut CSVs, and secondary
+    cloud PNGs. Counting uses the windowed text, not the full comment."""
     import pandas as pd
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from wordcloud import WordCloud
     if not os.path.exists(CORPUS_CSV):
         stage_corpus()
     df = pd.read_csv(CORPUS_CSV).fillna("")
     if df.empty:
-        log("[clouds] corpus is empty -- nothing to draw.")
+        log("[terms] corpus is empty -- nothing to analyze.")
         return
-    # per-brand token counts + whole-corpus baseline
-    brand_tokens = defaultdict(Counter)
-    corpus_tokens = Counter()
-    for _, r in df.iterrows():
-        toks = tokenize(str(r["text"]))
-        corpus_tokens.update(toks)
-        for b in str(r["brands_matched"]).split("|"):
-            if b:
-                brand_tokens[b].update(toks)
 
-    def draw(freqs, title, path):
+    # --- split single-brand vs multi-brand documents ------------------------
+    single_rows = defaultdict(list)   # brand -> [(tokens, snippet, url), ...]
+    multi_rows = []                   # [(brands, snippet, url), ...]
+    for _, r in df.iterrows():
+        bs = _brands_of(r)
+        win = _doc_window(r)
+        snippet = " ".join(win.split())
+        toks = tokenize(win)
+        if len(bs) == 1:
+            single_rows[bs[0]].append((toks, snippet, str(r["url"])))
+        elif len(bs) >= 2:
+            multi_rows.append((bs, snippet, str(r["url"])))
+
+    single_counts = {b: len(single_rows.get(b, [])) for b in BRANDS}
+    thin = [(b, n) for b, n in single_counts.items() if n < 40]
+
+    # --- per-brand distinctive terms (single-brand docs only) ---------------
+    analyzed = {b: [row[0] for row in single_rows.get(b, [])] for b in BRANDS}
+    tables = {}
+    for b in BRANDS:
+        group = analyzed[b]
+        rest = [toks for ob in BRANDS if ob != b for toks in analyzed[ob]]
+        scored = distinctive_ngrams(group, rest, top=15)
+        rows_out = []
+        for term, z, dc in scored:
+            ex_snip, ex_url = "", ""
+            needle = " " + term + " "
+            for toks, snip, url in single_rows.get(b, []):
+                if needle in (" " + " ".join(toks) + " "):
+                    ex_snip, ex_url = snip[:160], url
+                    break
+            rows_out.append((term, z, dc, ex_snip, ex_url))
+        tables[b] = rows_out
+
+    # --- write markdown + CSV tables ----------------------------------------
+    md = ["# Distinctive terms per brand",
+          "_Single-brand docs only, windowed text, log-odds over 1-3 grams, "
+          "brand/product names removed, terms in >= 3 docs._\n"]
+    with open(os.path.join(OUT_DIR, "distinctive_terms.csv"), "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["brand", "rank", "term", "logodds_z", "doc_count", "example", "url"])
+        for b in BRANDS:
+            n = single_counts[b]
+            flag = "  **THIN (<40 docs)**" if n < 40 else ""
+            md.append("## %s -- rests on %d single-brand docs%s\n" % (b, n, flag))
+            md.append("| # | term | score | docs | example |")
+            md.append("|---|------|-------|------|---------|")
+            for i, (term, z, dc, snip, url) in enumerate(tables[b], 1):
+                ex = ("[%s](%s)" % (snip.replace("|", "/")[:110], url)) if url else snip[:110]
+                md.append("| %d | %s | %.2f | %d | %s |" % (i, term, z, dc, ex))
+                wr.writerow([b, i, term, "%.3f" % z, dc, snip, url])
+            if not tables[b]:
+                md.append("| - | _(no terms with >= 3 docs)_ | | | |")
+            md.append("")
+    open(os.path.join(OUT_DIR, "distinctive_terms.md"), "w", encoding="utf-8").write("\n".join(md))
+    log("[terms] wrote outputs/distinctive_terms.md + distinctive_terms.csv")
+
+    # --- co-mention matrix (multi-brand docs) -------------------------------
+    brands = list(BRANDS.keys())
+    co = defaultdict(lambda: defaultdict(int))
+    for bs, snip, url in multi_rows:
+        uniq = sorted(set(bs))
+        for i in range(len(uniq)):
+            for j in range(i + 1, len(uniq)):
+                co[uniq[i]][uniq[j]] += 1
+                co[uniq[j]][uniq[i]] += 1
+    with open(os.path.join(OUT_DIR, "comention_matrix.csv"), "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["brand"] + brands)
+        for b in brands:
+            wr.writerow([b] + [co[b].get(o, 0) for o in brands])
+    log("[terms] wrote outputs/comention_matrix.csv (%d multi-brand docs)" % len(multi_rows))
+    _comention_heatmap(co, brands)
+
+    # --- targeted cuts ------------------------------------------------------
+    _targeted_cut(df, ["lap", "lapping", "lapped", "alignment", "misalign"],
+                  os.path.join(OUT_DIR, "cut_lapping_alignment.csv"))
+    _targeted_cut(df, ["price", "priced", "expensive", "cheap", "worth", "$"],
+                  os.path.join(OUT_DIR, "cut_price_terms.csv"))
+
+    # --- secondary clouds (cheap) -------------------------------------------
+    _draw_clouds(tables)
+
+    # --- reporting ----------------------------------------------------------
+    log("[terms] single-brand doc counts: %s" % single_counts)
+    if thin:
+        log("[terms] THIN brands (<40 single-brand docs): %s"
+            % ", ".join("%s=%d" % (b, n) for b, n in thin))
+    _print_brand_table("nightforce", tables.get("nightforce", []),
+                       single_counts.get("nightforce", 0))
+
+
+def _targeted_cut(df, tokens, path):
+    toks_low = [t.lower() for t in tokens]
+
+    def hits(low):
+        found = []
+        for t in toks_low:
+            if t == "$":
+                if "$" in low:
+                    found.append("$")
+            elif re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", low):
+                found.append(t)
+        return found
+
+    per_brand = defaultdict(lambda: {"count": 0, "urls": []})
+    for _, r in df.iterrows():
+        if not hits(_doc_window(r).lower()):
+            continue
+        for b in _brands_of(r):
+            per_brand[b]["count"] += 1
+            if len(per_brand[b]["urls"]) < 10:
+                per_brand[b]["urls"].append(str(r["url"]))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["brand", "doc_count", "example_urls"])
+        for b in BRANDS:
+            d = per_brand.get(b, {"count": 0, "urls": []})
+            wr.writerow([b, d["count"], " ".join(d["urls"])])
+    log("[terms] wrote %s" % path)
+
+
+def _comention_heatmap(co, brands):
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        log("[terms] (skip co-mention heat map) %s" % e)
+        return
+    M = np.array([[co[a].get(b, 0) for b in brands] for a in brands], dtype=float)
+    plt.figure(figsize=(max(6, len(brands)), max(5, len(brands) * 0.8)))
+    im = plt.imshow(M, cmap="Purples", aspect="auto")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(len(brands)), brands, rotation=45, ha="right", fontsize=8)
+    plt.yticks(range(len(brands)), brands, fontsize=9)
+    for i in range(len(brands)):
+        for j in range(len(brands)):
+            if M[i, j] > 0:
+                plt.text(j, i, "%d" % M[i, j], ha="center", va="center", fontsize=8)
+    plt.title("Brand co-mention (multi-brand docs)", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "comention_heat.png"), dpi=120)
+    plt.close()
+    log("[terms] wrote outputs/comention_heat.png")
+
+
+def _draw_clouds(tables):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from wordcloud import WordCloud
+    except Exception as e:
+        log("[terms] (skip clouds) %s" % e)
+        return
+    made = 0
+    for b, rows_out in tables.items():
+        freqs = {term: z for term, z, dc, snip, url in rows_out if z > 0}
         if not freqs:
-            log("[clouds] (skip) no distinctive terms for %s" % title)
-            return
+            continue
         wc = WordCloud(width=1000, height=600, background_color="white",
                        prefer_horizontal=0.9, collocations=False)
         wc.generate_from_frequencies(freqs)
         plt.figure(figsize=(10, 6))
         plt.imshow(wc, interpolation="bilinear")
         plt.axis("off")
-        plt.title(title, fontsize=14)
+        plt.title("Distinctive terms: %s" % b, fontsize=14)
         plt.tight_layout()
-        plt.savefig(path, dpi=120)
+        plt.savefig(os.path.join(OUT_DIR, "cloud_%s.png" % b), dpi=120)
         plt.close()
-        log("[clouds] wrote %s" % path)
-
-    made = 0
-    for brand in BRANDS:  # all 7, even if thin, so cloud count is deterministic
-        g = brand_tokens.get(brand, Counter())
-        rest = Counter(corpus_tokens)
-        rest.subtract(g)
-        rest = Counter({w: c for w, c in rest.items() if c > 0})
-        freqs = logodds_terms(g, rest)
-        draw(freqs, "Distinctive terms: %s" % brand, os.path.join(OUT_DIR, "cloud_%s.png" % brand))
         made += 1
-    # whole-corpus baseline (reference distribution -> frequency is appropriate here)
-    baseline = {w: c for w, c in corpus_tokens.most_common(80)}
-    draw(baseline, "Whole-corpus baseline", os.path.join(OUT_DIR, "cloud_baseline.png"))
-    made += 1
-    log("[clouds] produced %d cloud PNGs." % made)
+    log("[terms] produced %d secondary cloud PNGs." % made)
+
+
+def _print_brand_table(brand, rows_out, n):
+    log("\n=== Distinctive terms: %s  (rests on %d single-brand docs%s) ==="
+        % (brand, n, "; THIN" if n < 40 else ""))
+    log("%-3s %-24s %8s %5s  %s" % ("#", "term", "score", "docs", "example"))
+    for i, (term, z, dc, snip, url) in enumerate(rows_out, 1):
+        log("%-3d %-24s %8.2f %5d  %s" % (i, term[:24], z, dc, snip[:56]))
+    if not rows_out:
+        log("(no terms with >= 3 docs)")
 
 
 # ============================================================================
@@ -865,7 +1074,8 @@ def stage_classify():
     n_ok = n_bad = 0
     t0 = time.time()
     for i, r in enumerate(todo, 1):
-        text = str(r["text"])
+        # classification runs on the windowed text, not the full comment
+        text = str(r["window"]).strip() or str(r["text"])
         parsed, raw = ollama_classify(text)
         if parsed is None:  # retry once
             parsed, raw = ollama_classify(text)

@@ -1,0 +1,6 @@
+.env
+scratch/
+__pycache__/
+*.pyc
+outputs/
+cache/

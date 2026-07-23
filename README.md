@@ -32,8 +32,7 @@ different tag, open `market_voice.py` and edit the `OLLAMA_MODEL` line near the 
 (The script also self-checks on startup and prints your installed tags if the one
 it wants is missing — so you'll know exactly what to type.)
 
-> Note: there is no `gemma4` tag in Ollama. If you meant the Gemma 3n 2B model,
-> its tag is `gemma4:e2b`. Whatever `ollama list` prints is the source of truth.
+> Whatever `ollama list` prints is the source of truth for the tag.
 
 **YouTube API key.** The script finds your key automatically, in this order:
 1. the `YT_API_KEY` constant at the top of `market_voice.py` (paste it there if you like),

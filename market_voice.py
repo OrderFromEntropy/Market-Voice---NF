@@ -144,6 +144,13 @@ YOUTUBE_QUERIES = [
 REDDIT_SECONDS_BETWEEN = 2.0
 USER_AGENT = "personal-market-research/0.1 (one-off student project; contact in profile)"
 YOUTUBE_QUOTA_BUDGET = 5000
+# Reddit source. Reddit killed off free anonymous access to its own .json
+# endpoints, so "direct" now 403s. "pullpush" uses the PullPush public archive
+# (api.pullpush.io) of Reddit's public data -- no key, no dev app, and it reaches
+# deep history. Set to "direct" only if you have a working authenticated setup.
+REDDIT_SOURCE = "pullpush"          # "pullpush" | "direct"
+PULLPUSH_PAGES = 5                  # pages of 100 comments per brand query
+PULLPUSH_SECONDS_BETWEEN = 1.5      # polite pacing for the PullPush archive
 # Widened-pull knobs. search.list costs 100 units regardless of result count, so
 # 50 results is free extra coverage. Each comment page costs 1 unit and yields up
 # to 100 comments, so paginating a few pages per video is the cheapest way to add
@@ -554,6 +561,74 @@ def cached_exists(url, params=None):
 
 
 # ============================================================================
+#  STAGE 1c  COLLECT -- REDDIT via PULLPUSH archive (no auth, deep history)
+# ============================================================================
+PULLPUSH_COMMENT = "https://api.pullpush.io/reddit/search/comment/"
+
+
+def _pp_permalink(c):
+    """Best-effort reconstruction of a Reddit URL for a PullPush comment."""
+    p = c.get("permalink")
+    if p:
+        return p if str(p).startswith("http") else "https://www.reddit.com" + p
+    link = str(c.get("link_id", "")).replace("t3_", "")
+    cid = c.get("id", "")
+    if link and cid:
+        return "https://www.reddit.com/comments/%s/_/%s/" % (link, cid)
+    sub = c.get("subreddit", "")
+    return "https://www.reddit.com/r/%s/" % sub if sub else "https://www.reddit.com/"
+
+
+def collect_pullpush():
+    """Pull public Reddit comments from the PullPush archive. Queries '<brand>
+    mount' and '<brand> rings' per brand, paginated backwards through history via
+    the `before` cursor. Segment is tagged from each comment's subreddit."""
+    docs = []
+    made = 0
+    seg_map = {k.lower(): v for k, v in SUBREDDITS.items()}
+    for brand, name in PRIMARY_NAME.items():
+        for suffix in ("mount", "rings"):
+            q = "%s %s" % (name, suffix)
+            before = None
+            for _pg in range(PULLPUSH_PAGES):
+                params = {"q": q, "size": 100, "sort": "desc", "sort_type": "created_utc"}
+                if before:
+                    params["before"] = before
+                paced = 0 if cached_exists(PULLPUSH_COMMENT, params) else PULLPUSH_SECONDS_BETWEEN
+                data, cached = cached_get_json(PULLPUSH_COMMENT, headers=REDDIT_HEADERS,
+                                               params=params, pace_seconds=paced)
+                if not cached:
+                    made += 1
+                if not data or "data" not in data:
+                    if data and data.get("__error__"):
+                        log("  [pullpush] HTTP %s (%s) for %r"
+                            % (data["__error__"], data.get("__reason__", ""), q))
+                    break
+                items = data.get("data", [])
+                if not items:
+                    break
+                for c in items:
+                    body = (c.get("body") or "").strip()
+                    if not body or body in ("[removed]", "[deleted]"):
+                        continue
+                    sub = c.get("subreddit", "") or ""
+                    docs.append({
+                        "id": "pp_" + str(c.get("id", "")),
+                        "source": "reddit",
+                        "subreddit_or_video": sub,
+                        "segment": seg_map.get(sub.lower(), "mixed"),
+                        "url": _pp_permalink(c),
+                        "created_utc": iso_from_epoch(c.get("created_utc")),
+                        "text": body,
+                    })
+                before = items[-1].get("created_utc")
+                if not before:
+                    break
+    log("  [pullpush] collected %d raw comments in %d requests." % (len(docs), made))
+    return docs
+
+
+# ============================================================================
 #  STAGE 1  COLLECT (driver) -> writes cache; returns raw docs
 # ============================================================================
 def stage_collect():
@@ -562,8 +637,8 @@ def stage_collect():
     if api_key:
         log("  [youtube] API key resolved (ends ...%s)." % api_key[-4:])
     yt_docs = collect_youtube(api_key)
-    log("[collect] Reddit ...")
-    rd_docs = collect_reddit()
+    log("[collect] Reddit via %s ..." % REDDIT_SOURCE)
+    rd_docs = collect_pullpush() if REDDIT_SOURCE == "pullpush" else collect_reddit()
     raw = yt_docs + rd_docs
     # persist raw docs so downstream stages don't need to re-run collect
     with open(os.path.join(CACHE_DIR, "raw_docs.json"), "w", encoding="utf-8") as f:

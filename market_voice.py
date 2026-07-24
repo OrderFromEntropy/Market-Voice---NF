@@ -129,6 +129,13 @@ YOUTUBE_QUERIES = [
     "geissele super precision review", "warne mountain tech review",
     "leupold scope rings review", "best scope mount long range",
     "best lpvo mount", "scope mount comparison", "scope ring torque",
+    # --- widened pull: brand + model/problem queries for more single-brand text
+    "nightforce x-treme duty ultramount", "nightforce ultralite unimount",
+    "spuhr ideal scope mount", "badger ordnance c1 mount review",
+    "reptilia dot mount review", "geissele super precision mount review",
+    "warne skyline rings review", "leupold mark 4 rings review",
+    "scope ring lapping", "return to zero scope mount",
+    "34mm one piece scope mount", "picatinny scope mount review",
 ]
 # YouTube segment tag: "precision" if the video title matches long range / precision / PRS,
 # else "tactical" if it matches lpvo / ar15 / carbine, else "mixed".
@@ -137,6 +144,12 @@ YOUTUBE_QUERIES = [
 REDDIT_SECONDS_BETWEEN = 2.0
 USER_AGENT = "personal-market-research/0.1 (one-off student project; contact in profile)"
 YOUTUBE_QUOTA_BUDGET = 5000
+# Widened-pull knobs. search.list costs 100 units regardless of result count, so
+# 50 results is free extra coverage. Each comment page costs 1 unit and yields up
+# to 100 comments, so paginating a few pages per video is the cheapest way to add
+# text. Collection stops when it hits YOUTUBE_QUOTA_BUDGET or TARGET_COMMENTS.
+YT_SEARCH_RESULTS = 50        # videos per search query (max 50)
+YT_COMMENT_PAGES = 3          # comment pages to pull per video (100 comments each)
 
 # --- Classification prompt for the local model. Temperature 0. JSON only.
 CLASSIFY_PROMPT = """You label short comments about riflescope mounting accessories.
@@ -189,7 +202,7 @@ YT_API_KEY = ""
 
 # How many comments to target overall before we stop pulling (soft cap; keeps a
 # cold run inside a couple evenings). Set to None to pull everything found.
-TARGET_COMMENTS = 2500
+TARGET_COMMENTS = 8000
 
 # ============================================================================
 #  PATHS
@@ -368,14 +381,15 @@ def collect_youtube(api_key):
             break
         data, cached = cached_get_json(
             YT + "/search",
-            params={"key": api_key, "q": q, "part": "snippet",
-                    "type": "video", "maxResults": 25, "relevanceLanguage": "en"},
+            params={"key": api_key, "q": q, "part": "snippet", "type": "video",
+                    "maxResults": YT_SEARCH_RESULTS, "relevanceLanguage": "en"},
         )
         if not cached:
             _quota_used["units"] += 100
         if not data or "items" not in data:
             if data and data.get("__error__"):
-                log("  [youtube] search error %s for %r" % (data["__error__"], q))
+                log("  [youtube] search %s (%s) for %r"
+                    % (data["__error__"], data.get("__reason__", ""), q))
             continue
         for it in data["items"]:
             vid = it.get("id", {}).get("videoId")
@@ -384,30 +398,35 @@ def collect_youtube(api_key):
             seen_videos.add(vid)
             title = it.get("snippet", {}).get("title", "")
             seg = yt_segment_for_title(title)
-            if _quota_used["units"] + 1 > YOUTUBE_QUOTA_BUDGET:
-                log("  [youtube] quota budget reached; stopping comments.")
-                return docs
-            cdata, ccached = cached_get_json(
-                YT + "/commentThreads",
-                params={"key": api_key, "videoId": vid, "part": "snippet",
-                        "maxResults": 100, "textFormat": "plainText", "order": "relevance"},
-            )
-            if not ccached:
-                _quota_used["units"] += 1
-            if not cdata or "items" not in cdata:
-                continue  # comments disabled or error -> skip video
-            for c in cdata["items"]:
-                sn = c.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
-                text = sn.get("textDisplay", "")
-                docs.append({
-                    "id": "yt_" + c.get("id", vid),
-                    "source": "youtube",
-                    "subreddit_or_video": vid,
-                    "segment": seg,
-                    "url": "https://www.youtube.com/watch?v=%s&lc=%s" % (vid, c.get("id", "")),
-                    "created_utc": iso_from_epoch(_yt_epoch(sn.get("publishedAt"))),
-                    "text": text,
-                })
+            # pull up to YT_COMMENT_PAGES pages of comments for this video
+            page_token = None
+            for _page in range(YT_COMMENT_PAGES):
+                if _quota_used["units"] + 1 > YOUTUBE_QUOTA_BUDGET:
+                    log("  [youtube] quota budget reached; stopping comments.")
+                    return docs
+                params = {"key": api_key, "videoId": vid, "part": "snippet",
+                          "maxResults": 100, "textFormat": "plainText", "order": "relevance"}
+                if page_token:
+                    params["pageToken"] = page_token
+                cdata, ccached = cached_get_json(YT + "/commentThreads", params=params)
+                if not ccached:
+                    _quota_used["units"] += 1
+                if not cdata or "items" not in cdata:
+                    break  # comments disabled or error -> next video
+                for c in cdata["items"]:
+                    sn = c.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+                    docs.append({
+                        "id": "yt_" + c.get("id", vid),
+                        "source": "youtube",
+                        "subreddit_or_video": vid,
+                        "segment": seg,
+                        "url": "https://www.youtube.com/watch?v=%s&lc=%s" % (vid, c.get("id", "")),
+                        "created_utc": iso_from_epoch(_yt_epoch(sn.get("publishedAt"))),
+                        "text": sn.get("textDisplay", ""),
+                    })
+                page_token = cdata.get("nextPageToken")
+                if not page_token:
+                    break  # no more comment pages
             if TARGET_COMMENTS and len(docs) >= TARGET_COMMENTS:
                 log("  [youtube] hit target of %d comments." % TARGET_COMMENTS)
                 return docs

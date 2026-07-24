@@ -105,11 +105,17 @@ CATEGORY_TOKENS_ACCESSORY_OTHER = [
     "throw lever", "cat tail", "cattail",
 ]
 
-# --- Fixed attribute taxonomy for classification. Do not extend without re-running validation.
+# --- Attribute taxonomy for classification. Collapsed from the original 11-way
+# set to 7 domain buckets after validation showed the fine-grained split hurt both
+# human and model agreement. Re-validate (agreement.py) after any change.
 ATTRIBUTES = [
-    "return_to_zero", "durability", "weight", "machining_finish", "price_value",
-    "qd_repeatability", "customer_service_warranty", "availability_leadtime",
-    "fit_height_options", "install_experience", "other",
+    "zero_retention",            # holding/returning to zero, QD repeatability, zero shift
+    "build_quality",             # durability, toughness, materials, machining, finish
+    "weight",                    # how heavy or light the mount is
+    "price_value",               # cost, worth, expensive/cheap, value for money
+    "fit_and_install",           # ring height, clearance, cantilever/offset, torque, install
+    "availability_and_service",  # in stock / lead time / where to buy, CS, warranty, returns
+    "other",                     # anything else, or too vague to place
 ]
 
 # --- Sources and segments.
@@ -165,28 +171,48 @@ YT_SEARCH_RESULTS = 50        # videos per search query (max 50)
 YT_COMMENT_PAGES = 3          # comment pages to pull per video (100 comments each)
 
 # --- Classification prompt for the local model. Temperature 0. JSON only.
-CLASSIFY_PROMPT = """You label short comments about riflescope mounting accessories.
+CLASSIFY_PROMPT = """You label short comments about riflescope MOUNTS, rings, and bases.
 Return ONLY a JSON object, no prose, exactly matching this schema:
 {"brands": [zero or more of: nightforce, leupold, reptilia, badger_ordnance, spuhr,
-geissele, warne, other, none], "attribute": one of [return_to_zero, durability, weight,
-machining_finish, price_value, qd_repeatability, customer_service_warranty,
-availability_leadtime, fit_height_options, install_experience, other],
+geissele, warne, other, none],
+"attribute": one of [zero_retention, build_quality, weight, price_value,
+fit_and_install, availability_and_service, other],
 "sentiment": one of [positive, negative, neutral, mixed], "quotable": true or false}
-Pick the single attribute the comment is MOST about. quotable is true only if the comment
-is vivid, specific, and under about 60 words. Watch for sarcasm; "only lost zero twice,
-great value" is negative.
+
+Pick the SINGLE attribute the comment is MOST about:
+- zero_retention: holding or returning to zero, repeatability, QD lockup, zero shift after remounting.
+- build_quality: durability, toughness, materials, machining, finish, how solid it feels.
+- weight: how heavy or light the mount is.
+- price_value: cost, worth, expensive/cheap, value for money.
+- fit_and_install: ring height, objective clearance, cantilever/offset, torque, install experience, whether it fits.
+- availability_and_service: in stock / lead time / where to buy, customer service, warranty, returns.
+- other: anything else, or too vague to place (general questions, build lists, chit-chat).
+
+sentiment is the commenter's stance toward the MOUNT. WATCH SARCASM: "only lost zero
+twice, great value" is negative. Use neutral for a plain fact or a question; mixed only
+when clear positives AND negatives appear together. quotable is true only if the comment
+is vivid, specific, and under about 60 words.
 
 Comment: "Swapped to a Spuhr and my zero survives barrel swaps, worth every penny."
-{"brands": ["spuhr"], "attribute": "return_to_zero", "sentiment": "positive", "quotable": true}
+{"brands": ["spuhr"], "attribute": "zero_retention", "sentiment": "positive", "quotable": true}
 
 Comment: "The badger c1 is a tank but man it is heavy on a 6lb hunting rig"
 {"brands": ["badger_ordnance"], "attribute": "weight", "sentiment": "mixed", "quotable": true}
 
 Comment: "my warne only lost zero twice this season, great value lol"
-{"brands": ["warne"], "attribute": "return_to_zero", "sentiment": "negative", "quotable": true}
+{"brands": ["warne"], "attribute": "zero_retention", "sentiment": "negative", "quotable": true}
+
+Comment: "Machining on the Reptilia is gorgeous, feels milled from billet."
+{"brands": ["reptilia"], "attribute": "build_quality", "sentiment": "positive", "quotable": true}
+
+Comment: "Been waiting 3 months for the geissele mount to restock, ridiculous."
+{"brands": ["geissele"], "attribute": "availability_and_service", "sentiment": "negative", "quotable": true}
+
+Comment: "Leupold CS replaced my cross-slot base no charge, shipped in 2 days."
+{"brands": ["leupold"], "attribute": "availability_and_service", "sentiment": "positive", "quotable": true}
 
 Comment: "What height rings do I need for a 56mm objective on a 700?"
-{"brands": ["none"], "attribute": "fit_height_options", "sentiment": "neutral", "quotable": false}
+{"brands": ["none"], "attribute": "fit_and_install", "sentiment": "neutral", "quotable": false}
 
 Comment: {comment}
 """
@@ -205,7 +231,7 @@ SAMPLE_COMMENTS = [
 # ============================================================================
 # Your installed Ollama model tag. Run `ollama list` to confirm. The script
 # self-checks this on startup and prints your installed tags if it is missing.
-OLLAMA_MODEL = "gemma4:e2b"
+OLLAMA_MODEL = "qwen2.5:14b"
 OLLAMA_URL = "http://localhost:11434"
 
 # Paste your YouTube Data API key here to hard-wire it (optional). If left blank,
@@ -1569,6 +1595,7 @@ def stage_report():
 
     # ---- validation_sample.csv : stratified 50, empty human columns ----
     _write_validation_sample(labeled)
+    _write_label_guide()
 
     # ---- agreement.py ----
     open(os.path.join(OUT_DIR, "agreement.py"), "w", encoding="utf-8").write(AGREEMENT_PY)
@@ -1576,6 +1603,31 @@ def stage_report():
 
     # ---- memo.md ----
     _write_memo(df, labeled)
+
+
+def _write_label_guide():
+    """Reference so hand-labels use the EXACT taxonomy strings (a vocabulary
+    mismatch here silently tanks the agreement score)."""
+    guide = (
+        "VALIDATION LABELING GUIDE\n" + "=" * 40 + "\n\n"
+        "In validation_sample.csv, fill:\n"
+        "  human_attribute  = EXACTLY ONE of:\n    " + ", ".join(ATTRIBUTES) + "\n"
+        "  human_sentiment  = EXACTLY ONE of:\n    positive, negative, neutral, mixed\n\n"
+        "Copy the strings verbatim -- 'product_quality' or 'build quality' will\n"
+        "score as a miss. Use the model's columns only as a reference, not a crutch.\n\n"
+        "Attribute definitions:\n"
+        "  zero_retention           holding/returning to zero, QD repeatability, zero shift\n"
+        "  build_quality            durability, materials, machining, finish, how solid it feels\n"
+        "  weight                   how heavy or light the mount is\n"
+        "  price_value              cost, worth, expensive/cheap, value for money\n"
+        "  fit_and_install          ring height, clearance, offset, torque, install, fitment\n"
+        "  availability_and_service in stock / lead time / where to buy, CS, warranty, returns\n"
+        "  other                    anything else, or too vague (questions, build lists)\n\n"
+        "Sentiment: stance toward the MOUNT. Watch sarcasm ('only lost zero twice,\n"
+        "great value' = negative). neutral = a plain fact/question; mixed = clear\n"
+        "positives AND negatives together.\n")
+    open(os.path.join(OUT_DIR, "label_guide.txt"), "w", encoding="utf-8").write(guide)
+    log("[report] wrote outputs/label_guide.txt")
 
 
 def _write_validation_sample(labeled):

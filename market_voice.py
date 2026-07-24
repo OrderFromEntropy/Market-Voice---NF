@@ -45,6 +45,7 @@ import os
 import re
 import sys
 import csv
+import html
 import json
 import time
 import math
@@ -148,6 +149,9 @@ YOUTUBE_QUOTA_BUDGET = 5000
 # endpoints, so "direct" now 403s. "pullpush" uses the PullPush public archive
 # (api.pullpush.io) of Reddit's public data -- no key, no dev app, and it reaches
 # deep history. Set to "direct" only if you have a working authenticated setup.
+# Heat-map / verbatim cells with fewer than this many supporting docs are treated
+# as too thin to headline (kept in the matrices, flagged in findings_candidates).
+MIN_CELL_SUPPORT = 10
 REDDIT_SOURCE = "pullpush"          # "pullpush" | "direct"
 PULLPUSH_PAGES = 5                  # pages of 100 comments per brand query
 PULLPUSH_SECONDS_BETWEEN = 2.0      # polite pacing for the PullPush archive
@@ -712,6 +716,8 @@ def stage_corpus():
     dropped_short = dropped_dupe = dropped_bot = dropped_nomatch = 0
     for d in raw:
         text = (d.get("text") or "").strip()
+        # decode HTML entities (&amp; -> &) so near-duplicates collapse and text is clean
+        text = html.unescape(text)
         if len(text) < 25:
             dropped_short += 1
             continue
@@ -746,11 +752,13 @@ def stage_corpus():
             "attribute": "",
             "sentiment": "",
             "quotable": "",
+            "model_brands": "",
             "model_raw": "",
         })
     df = pd.DataFrame(rows, columns=[
         "id", "source", "subreddit_or_video", "segment", "url", "created_utc",
-        "text", "window", "brands_matched", "bucket", "attribute", "sentiment", "quotable", "model_raw"])
+        "text", "window", "brands_matched", "bucket", "attribute", "sentiment",
+        "quotable", "model_brands", "model_raw"])
     df.to_csv(CORPUS_CSV, index=False)
     log("[corpus] wrote %s : %d documents" % (CORPUS_CSV, len(df)))
     log("[corpus] dropped -> short:%d dupe:%d bot:%d no-brand/token:%d"
@@ -1255,6 +1263,8 @@ def _merge_labels_into_corpus():
     if not os.path.exists(CLASSIFIED_CSV):
         return
     df = pd.read_csv(CORPUS_CSV).fillna("")
+    if "model_brands" not in df.columns:
+        df["model_brands"] = ""
     lab = pd.read_csv(CLASSIFIED_CSV).fillna("")
     lab_ok = lab[lab["status"] == "ok"].drop_duplicates("id", keep="last").set_index("id")
     for idx, r in df.iterrows():
@@ -1263,9 +1273,21 @@ def _merge_labels_into_corpus():
             df.at[idx, "attribute"] = L["attribute"]
             df.at[idx, "sentiment"] = L["sentiment"]
             df.at[idx, "quotable"] = L["quotable"]
+            df.at[idx, "model_brands"] = str(L["brands"])   # brands the MODEL judged the comment to be about
             df.at[idx, "model_raw"] = str(L["model_raw"])[:200]
     df.to_csv(CORPUS_CSV, index=False)
     log("[classify] merged labels back into corpus.csv")
+
+
+def _model_brands(r):
+    """Brands the classifier judged the comment to be ABOUT (drops none/other).
+    Falls back to the keyword match only if the model gave nothing usable."""
+    raw = str(r.get("model_brands", "") or "")
+    hits = [b for b in raw.split("|") if b in BRANDS]
+    if hits:
+        return hits
+    # fallback: keyword match (older corpora without model_brands)
+    return [b for b in str(r.get("brands_matched", "")).split("|") if b in BRANDS]
 
 
 # ============================================================================
@@ -1282,7 +1304,9 @@ def _matrices(df):
         sent = r.get("sentiment", "")
         if attr not in ATTRIBUTES:
             continue
-        brands = [b for b in str(r.get("brands_matched", "")).split("|") if b]
+        # attribute the cell to the brand(s) the MODEL judged the comment to be
+        # about -- not every brand a build-list post happens to name
+        brands = _model_brands(r)
         for b in brands:
             mention[b][attr] += 1
             tot[b][attr] += 1
@@ -1339,6 +1363,7 @@ def stage_analyze():
     import pandas as pd
     if not os.path.exists(CORPUS_CSV):
         stage_corpus()
+    _merge_labels_into_corpus()   # ensure model labels (incl. model_brands) are synced
     df = pd.read_csv(CORPUS_CSV).fillna("")
     labeled = df[df["attribute"].isin(ATTRIBUTES)]
     if labeled.empty:
@@ -1358,6 +1383,9 @@ def stage_analyze():
     _heatmap(net, brands, attrs, "Net sentiment (pos-neg)/total",
              os.path.join(OUT_DIR, "heat_net_sentiment.png"), "RdYlGn",
              center_zero=True, fmt="%.2f")
+    # overall matrices as CSV (counts, net sentiment, support) -- easy to read/cite
+    _write_matrix_csv(mention, os.path.join(OUT_DIR, "mention_counts_all.csv"), brands, attrs)
+    _write_matrix_csv(net, os.path.join(OUT_DIR, "net_sentiment_all.csv"), brands, attrs)
     # segment splits
     for seg in ("precision", "tactical"):
         sub = labeled[labeled["segment"] == seg]
@@ -1367,8 +1395,30 @@ def stage_analyze():
         m2, n2, t2 = _matrices(sub)
         _write_matrix_csv(m2, os.path.join(OUT_DIR, "mention_share_%s.csv" % seg), brands, attrs)
         _write_matrix_csv(n2, os.path.join(OUT_DIR, "net_sentiment_%s.csv" % seg), brands, attrs)
-    # stash the net matrix for the "surprising cells" printout
+    # per-brand sentiment distribution -- surfaces the positive skew honestly
+    _write_sentiment_distribution(labeled, brands)
+    # robust cells only -> findings candidates + the "surprising cells" printout
     _dump_net_for_summary(net, tot, brands, attrs)
+    _write_findings_candidates(mention, net, tot, brands, attrs)
+
+
+def _write_sentiment_distribution(labeled, brands):
+    dist = {b: Counter() for b in brands}
+    for _, r in labeled.iterrows():
+        s = r.get("sentiment", "")
+        for b in _model_brands(r):
+            dist[b][s] += 1
+    path = os.path.join(OUT_DIR, "sentiment_distribution.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["brand", "positive", "negative", "neutral", "mixed", "total", "pct_positive"])
+        for b in brands:
+            c = dist[b]
+            tot = sum(c.values())
+            pct = (100.0 * c["positive"] / tot) if tot else 0.0
+            wr.writerow([b, c["positive"], c["negative"], c["neutral"], c["mixed"],
+                         tot, "%.0f%%" % pct])
+    log("[analyze] wrote %s" % path)
 
 
 def _dump_net_for_summary(net, tot, brands, attrs):
@@ -1376,9 +1426,47 @@ def _dump_net_for_summary(net, tot, brands, attrs):
     for b in brands:
         for a in attrs:
             t = tot.get(b, {}).get(a, 0)
-            if t >= 3:  # only cells with a little support
+            if t >= MIN_CELL_SUPPORT:   # only cells robust enough to headline
                 cells.append((b, a, net[b][a], t))
     json.dump(cells, open(os.path.join(CACHE_DIR, "net_cells.json"), "w"))
+
+
+def _write_findings_candidates(mention, net, tot, brands, attrs):
+    """Rank the robust cells (support >= MIN_CELL_SUPPORT) so real findings are
+    obvious instead of small-n flukes."""
+    robust = []
+    for b in brands:
+        for a in attrs:
+            t = tot.get(b, {}).get(a, 0)
+            if t >= MIN_CELL_SUPPORT:
+                robust.append((b, a, mention[b].get(a, 0), net[b].get(a, 0.0), t))
+    lines = ["# Findings candidates",
+             "_Only cells with >= %d supporting docs. Brand = the model's judgment "
+             "of what each comment is about. Net sentiment is skewed positive across "
+             "the board (enthusiast forums) -- compare brands, don't read absolutes._\n"
+             % MIN_CELL_SUPPORT]
+
+    lines.append("## Most talked-about cells (by mention volume)\n")
+    lines.append("| brand | attribute | mentions | net sentiment | n |")
+    lines.append("|---|---|---|---|---|")
+    for b, a, m_, nv, t in sorted(robust, key=lambda x: x[2], reverse=True)[:12]:
+        lines.append("| %s | %s | %d | %+.2f | %d |" % (b, a, m_, nv, t))
+
+    lines.append("\n## Most positive cells (robust)\n")
+    lines.append("| brand | attribute | net sentiment | mentions | n |")
+    lines.append("|---|---|---|---|---|")
+    for b, a, m_, nv, t in sorted(robust, key=lambda x: x[3], reverse=True)[:8]:
+        lines.append("| %s | %s | %+.2f | %d | %d |" % (b, a, nv, m_, t))
+
+    lines.append("\n## Least positive cells (robust) -- where criticism concentrates\n")
+    lines.append("| brand | attribute | net sentiment | mentions | n |")
+    lines.append("|---|---|---|---|---|")
+    for b, a, m_, nv, t in sorted(robust, key=lambda x: x[3])[:8]:
+        lines.append("| %s | %s | %+.2f | %d | %d |" % (b, a, nv, m_, t))
+
+    open(os.path.join(OUT_DIR, "findings_candidates.md"), "w", encoding="utf-8").write(
+        "\n".join(lines) + "\n")
+    log("[analyze] wrote outputs/findings_candidates.md (%d robust cells)" % len(robust))
 
 
 # ============================================================================
@@ -1432,29 +1520,36 @@ def stage_report():
     import pandas as pd
     if not os.path.exists(CORPUS_CSV):
         stage_corpus()
+    _merge_labels_into_corpus()   # ensure model labels (incl. model_brands) are synced
     df = pd.read_csv(CORPUS_CSV).fillna("")
     labeled = df[df["attribute"].isin(ATTRIBUTES)]
 
-    # ---- verbatims.md : best quotable comments per notable cell ----
+    def _has_brand(r, b):
+        return b in _model_brands(r)
+
+    # ---- verbatims.md : best quotable comments per notable (robust) cell ----
     notable = []
     if os.path.exists(os.path.join(CACHE_DIR, "net_cells.json")):
         cells = json.load(open(os.path.join(CACHE_DIR, "net_cells.json")))
         cells.sort(key=lambda c: (abs(c[2]), c[3]), reverse=True)
         notable = cells[:12]
-    lines = ["# Verbatims -- best quotable comments per notable cell\n"]
+    lines = ["# Verbatims -- best quotable comments per notable cell",
+             "_Cells with >= %d docs; brand = the model's judgment of what the "
+             "comment is about; snippet is the windowed text._\n" % MIN_CELL_SUPPORT]
     for b, a, netval, t in notable:
         lines.append("## %s / %s   (net sentiment %+.2f over %d docs)\n" % (b, a, netval, t))
-        sub = labeled[(labeled["brands_matched"].str.contains(b, na=False)) &
-                      (labeled["attribute"] == a)]
+        sub = labeled[(labeled["attribute"] == a)
+                      & labeled.apply(lambda r: _has_brand(r, b), axis=1)]
         q = sub[sub["quotable"].astype(str).str.lower().isin(["true", "1"])]
         pick = q if not q.empty else sub
         for _, r in pick.head(5).iterrows():
-            snippet = " ".join(str(r["text"]).split())[:240]
+            snippet = " ".join(str(r.get("window") or r["text"]).split())[:240]
             lines.append("- \"%s\"  \n  <%s>  (%s, %s)" %
                          (snippet, r["url"], r["source"], r["sentiment"]))
         lines.append("")
     if not notable:
-        lines.append("_No classified cells with enough support yet. Run classify + analyze._")
+        lines.append("_No cells with >= %d supporting docs yet. Run classify + analyze._"
+                     % MIN_CELL_SUPPORT)
     open(os.path.join(OUT_DIR, "verbatims.md"), "w", encoding="utf-8").write("\n".join(lines))
     log("[report] wrote outputs/verbatims.md")
 
@@ -1477,10 +1572,11 @@ def _write_validation_sample(labeled):
             "human_attribute,human_sentiment\n")
         log("[report] wrote empty validation_sample.csv (nothing classified yet)")
         return
-    # stratify across brand x sentiment
+    # stratify across brand x sentiment (brand = model's judgment)
     buckets = defaultdict(list)
     for _, r in labeled.iterrows():
-        b = (str(r["brands_matched"]).split("|") or ["none"])[0]
+        mb = _model_brands(r)
+        b = mb[0] if mb else "none"
         buckets[(b, r["sentiment"])].append(r)
     picked = []
     # round-robin across strata until we have 50
@@ -1497,9 +1593,9 @@ def _write_validation_sample(labeled):
     for r in picked[:50]:
         rows.append({
             "id": r["id"],
-            "text": " ".join(str(r["text"]).split())[:300],
+            "text": " ".join(str(r.get("window") or r["text"]).split())[:300],
             "url": r["url"],
-            "model_brands": r["brands_matched"],
+            "model_brands": "|".join(_model_brands(r)),
             "model_attribute": r["attribute"],
             "model_sentiment": r["sentiment"],
             "human_attribute": "",
@@ -1534,12 +1630,16 @@ model and summarized as differential word clouds and brand-by-attribute heat map
 Valid-JSON classification rate: {valid_rate}
 
 ## Three findings
-1. TODO -- <lead finding; cite a heat-map cell and a verbatim>
+_Pull from findings_candidates.md -- it ranks only cells with >= {min_support} docs._
+1. TODO -- <lead finding; cite a robust heat-map cell and a verbatim>
 2. TODO -- <second finding>
 3. TODO -- <third finding>
 
 ## One limitation, named unprompted
-TODO -- <e.g. self-selected forum voices; small n in some cells; single-model labels>
+TODO -- Sentiment runs heavily positive across every brand (see
+sentiment_distribution.csv): this is a self-selected enthusiast sample -- people
+who bought a mount and like it. Compare brands relative to each other, not against
+zero; pair with a returns/warranty dataset before drawing absolute conclusions.
 
 ## How I validated
 I audited my own labels the way I'd audit a build: a stratified 50-row sample
@@ -1548,9 +1648,15 @@ separately for attribute and sentiment. TODO -- <insert the two agreement number
 
 ## Method notes
 - Filter: a document survives only if it matches >=1 brand alias AND >=1 category token.
-- Clouds: log-odds with an informative Dirichlet prior vs the corpus baseline.
+- Windowing: counting and classification use the brand-mention sentence +/-1, not the full comment.
+- Cells: a comment is attributed to the brand(s) the MODEL judged it to be about,
+  not every brand a build-list post happens to name.
+- Support gate: cells with < {min_support} docs are excluded from findings_candidates.
+- Terms: log-odds (informative Dirichlet prior) over 1-3 grams, single-brand docs,
+  brand/product/scope names stripped.
 - Sentiment: net = (positive - negative) / total per brand x attribute cell.
-""".format(stats=stats, valid_rate=valid_rate or "TODO -- run classify")
+""".format(stats=stats, valid_rate=valid_rate or "TODO -- run classify",
+           min_support=MIN_CELL_SUPPORT)
     open(os.path.join(OUT_DIR, "memo.md"), "w", encoding="utf-8").write(memo)
     log("[report] wrote outputs/memo.md")
 

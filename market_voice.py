@@ -376,13 +376,18 @@ def check_dependencies(need_plotting=True, need_ollama=False):
 
 
 def check_ollama_model():
-    """Return True if OLLAMA_MODEL is reachable; print available tags if not."""
-    data, _ = cached_get_json(OLLAMA_URL + "/api/tags")
+    """Return True if OLLAMA_MODEL is reachable; print available tags if not.
+    Always queries Ollama live -- the installed-model list is dynamic state and
+    must never be read from the disk cache (a stale snapshot would hide models
+    you pulled after the first run)."""
+    data = None
+    try:
+        r = requests.get(OLLAMA_URL + "/api/tags", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+    except Exception:
+        data = None
     if not data or "models" not in data:
-        # Don't cache a failed reach; delete any stale cache entry.
-        cp = cache_path_for(OLLAMA_URL + "/api/tags")
-        if os.path.exists(cp):
-            os.remove(cp)
         log("\n*** Could not reach Ollama at %s" % OLLAMA_URL)
         log("*** Start Ollama (it should be listening on 11434), then re-run.\n")
         return False

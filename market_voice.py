@@ -233,6 +233,10 @@ SAMPLE_COMMENTS = [
 # self-checks this on startup and prints your installed tags if it is missing.
 OLLAMA_MODEL = "qwen2.5:14b"
 OLLAMA_URL = "http://localhost:11434"
+# Classification prompts are short (a windowed comment + examples ~ under 1500
+# tokens), so a small context window is plenty -- and a smaller window frees VRAM,
+# letting more of a 14B model sit on the GPU instead of spilling to CPU.
+OLLAMA_NUM_CTX = 2048
 
 # Paste your YouTube Data API key here to hard-wire it (optional). If left blank,
 # the script looks for YT_API_KEY in the environment, then a .env file next to
@@ -1186,7 +1190,7 @@ def ollama_classify(text):
     """Return (parsed_dict_or_None, raw_string)."""
     prompt = CLASSIFY_PROMPT.replace("{comment}", json.dumps(text)[1:-1])
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-               "format": "json", "options": {"temperature": 0}}
+               "format": "json", "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX}}
     try:
         r = requests.post(OLLAMA_URL + "/api/generate", json=payload, timeout=120)
     except Exception as e:

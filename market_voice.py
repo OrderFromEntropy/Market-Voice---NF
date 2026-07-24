@@ -1474,41 +1474,55 @@ def _write_findings_candidates(mention, net, tot, brands, attrs):
 # ============================================================================
 AGREEMENT_PY = '''# -*- coding: utf-8 -*-
 """
-agreement.py -- human-vs-model agreement scorer.
+agreement.py -- human-vs-model agreement scorer + confusion diagnostics.
 
 After you fill in the human_attribute and human_sentiment columns in
 validation_sample.csv, run:   python agreement.py
-It reports percent agreement SEPARATELY for attribute and for sentiment.
+Reports overall agreement AND where the model fails, so refinement is targeted.
 """
 import csv, os
+from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join(HERE, "validation_sample.csv")
 
 
+def pct(n, d):
+    return "%.1f%% (%d/%d)" % (100.0 * n / d, n, d) if d else "(no labels)"
+
+
 def main():
     rows = list(csv.DictReader(open(PATH, encoding="utf-8")))
-    a_tot = a_ok = s_tot = s_ok = 0
-    for r in rows:
-        h_a = (r.get("human_attribute") or "").strip()
-        h_s = (r.get("human_sentiment") or "").strip()
-        if h_a:
-            a_tot += 1
-            if h_a == (r.get("model_attribute") or "").strip():
-                a_ok += 1
-        if h_s:
-            s_tot += 1
-            if h_s == (r.get("model_sentiment") or "").strip():
-                s_ok += 1
-    print("Labeled rows scored:")
-    if a_tot:
-        print("  attribute agreement: %.1f%% (%d/%d)" % (100.0 * a_ok / a_tot, a_ok, a_tot))
-    else:
-        print("  attribute agreement: (no human labels yet)")
-    if s_tot:
-        print("  sentiment agreement: %.1f%% (%d/%d)" % (100.0 * s_ok / s_tot, s_ok, s_tot))
-    else:
-        print("  sentiment agreement: (no human labels yet)")
+    A = [((r.get("human_attribute") or "").strip(), (r.get("model_attribute") or "").strip())
+         for r in rows if (r.get("human_attribute") or "").strip()]
+    S = [((r.get("human_sentiment") or "").strip(), (r.get("model_sentiment") or "").strip())
+         for r in rows if (r.get("human_sentiment") or "").strip()]
+
+    print("=== Overall agreement ===")
+    print("  attribute:", pct(sum(h == m for h, m in A), len(A)))
+    print("  sentiment:", pct(sum(h == m for h, m in S), len(S)))
+
+    if A:
+        print("\\n=== Attribute diagnostics ===")
+        other = sum(1 for h, m in A if m == "other")
+        print("  model said 'other':", pct(other, len(A)))
+        committed = [(h, m) for h, m in A if m != "other"]
+        print("  agreement when model committed (model != other):",
+              pct(sum(h == m for h, m in committed), len(committed)))
+        mis = Counter((h, m) for h, m in A if h != m)
+        print("  top human -> model mismatches:")
+        for (h, m), c in mis.most_common(10):
+            print("     %-26s -> %-26s x%d" % (h or "(blank)", m or "(blank)", c))
+
+    if S:
+        print("\\n=== Sentiment confusion (rows = your label, cols = model) ===")
+        labels = ["positive", "negative", "neutral", "mixed"]
+        conf = defaultdict(Counter)
+        for h, m in S:
+            conf[h][m] += 1
+        print("  %-12s %s" % ("you\\\\model", " ".join("%-9s" % l for l in labels)))
+        for h in labels:
+            print("  %-12s %s" % (h, " ".join("%-9d" % conf[h][m] for m in labels)))
 
 
 if __name__ == "__main__":

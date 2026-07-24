@@ -1566,8 +1566,21 @@ def stage_report():
 
 def _write_validation_sample(labeled):
     import pandas as pd
+    vpath = os.path.join(OUT_DIR, "validation_sample.csv")
+    # NEVER overwrite a sample that already exists -- it may hold your hand labels.
+    # Delete the file yourself if you want a fresh, unlabeled sample.
+    if os.path.exists(vpath):
+        try:
+            existing = pd.read_csv(vpath).fillna("")
+            labeled_n = ((existing.get("human_attribute", "").astype(str).str.strip() != "") |
+                         (existing.get("human_sentiment", "").astype(str).str.strip() != "")).sum()
+        except Exception:
+            labeled_n = 0
+        log("[report] validation_sample.csv already exists (%d rows hand-labeled) "
+            "-- leaving it untouched. Delete it to regenerate." % int(labeled_n))
+        return
     if labeled.empty:
-        open(os.path.join(OUT_DIR, "validation_sample.csv"), "w", encoding="utf-8").write(
+        open(vpath, "w", encoding="utf-8").write(
             "id,text,url,model_brands,model_attribute,model_sentiment,"
             "human_attribute,human_sentiment\n")
         log("[report] wrote empty validation_sample.csv (nothing classified yet)")
@@ -1603,7 +1616,7 @@ def _write_validation_sample(labeled):
         })
     pd.DataFrame(rows, columns=["id", "text", "url", "model_brands", "model_attribute",
                                 "model_sentiment", "human_attribute", "human_sentiment"]
-                 ).to_csv(os.path.join(OUT_DIR, "validation_sample.csv"), index=False)
+                 ).to_csv(vpath, index=False)
     log("[report] wrote outputs/validation_sample.csv (%d rows)" % len(rows))
 
 

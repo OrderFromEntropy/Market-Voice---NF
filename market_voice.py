@@ -150,7 +150,9 @@ YOUTUBE_QUOTA_BUDGET = 5000
 # deep history. Set to "direct" only if you have a working authenticated setup.
 REDDIT_SOURCE = "pullpush"          # "pullpush" | "direct"
 PULLPUSH_PAGES = 5                  # pages of 100 comments per brand query
-PULLPUSH_SECONDS_BETWEEN = 1.5      # polite pacing for the PullPush archive
+PULLPUSH_SECONDS_BETWEEN = 2.0      # polite pacing for the PullPush archive
+PULLPUSH_MAX_RETRIES = 4            # retries on HTTP 429 / transient errors
+PULLPUSH_BACKOFF = 5               # base backoff seconds (5, 10, 20, 40)
 # Widened-pull knobs. search.list costs 100 units regardless of result count, so
 # 50 results is free extra coverage. Each comment page costs 1 unit and yields up
 # to 100 comments, so paginating a few pages per video is the cheapest way to add
@@ -579,6 +581,29 @@ def _pp_permalink(c):
     return "https://www.reddit.com/r/%s/" % sub if sub else "https://www.reddit.com/"
 
 
+def _pullpush_get(params, made):
+    """GET one PullPush page with exponential backoff on 429 / transient errors.
+    Returns (data_or_None, updated_made_count)."""
+    data = None
+    for attempt in range(PULLPUSH_MAX_RETRIES + 1):
+        paced = 0 if cached_exists(PULLPUSH_COMMENT, params) else PULLPUSH_SECONDS_BETWEEN
+        data, cached = cached_get_json(PULLPUSH_COMMENT, headers=REDDIT_HEADERS,
+                                       params=params, pace_seconds=paced)
+        if not cached:
+            made += 1
+        transient = (data is None) or (isinstance(data, dict)
+                    and data.get("__error__") in (429, 500, 502, 503, 504))
+        if not transient:
+            return data, made
+        if attempt < PULLPUSH_MAX_RETRIES:
+            wait = PULLPUSH_BACKOFF * (2 ** attempt)
+            code = data.get("__error__", "network") if data else "network"
+            log("  [pullpush] %s -- backoff %ds (retry %d/%d)"
+                % (code, wait, attempt + 1, PULLPUSH_MAX_RETRIES))
+            time.sleep(wait)
+    return data, made
+
+
 def collect_pullpush():
     """Pull public Reddit comments from the PullPush archive. Queries '<brand>
     mount' and '<brand> rings' per brand, paginated backwards through history via
@@ -594,15 +619,11 @@ def collect_pullpush():
                 params = {"q": q, "size": 100, "sort": "desc", "sort_type": "created_utc"}
                 if before:
                     params["before"] = before
-                paced = 0 if cached_exists(PULLPUSH_COMMENT, params) else PULLPUSH_SECONDS_BETWEEN
-                data, cached = cached_get_json(PULLPUSH_COMMENT, headers=REDDIT_HEADERS,
-                                               params=params, pace_seconds=paced)
-                if not cached:
-                    made += 1
+                data, made = _pullpush_get(params, made)
                 if not data or "data" not in data:
                     if data and data.get("__error__"):
-                        log("  [pullpush] HTTP %s (%s) for %r"
-                            % (data["__error__"], data.get("__reason__", ""), q))
+                        log("  [pullpush] gave up page for %r after retries (HTTP %s)"
+                            % (q, data["__error__"]))
                     break
                 items = data.get("data", [])
                 if not items:
@@ -811,6 +832,34 @@ for _al in BRANDS.values():
         for _t in re.findall(r"[a-z0-9]+", _a.lower()):
             BRAND_TOKENS.add(_t)
 
+# Adjacent products that co-occur in Reddit "build list" posts but are NOT scope
+# mounts -- scope brands/models, red dots, bipods, triggers, chassis/actions, and
+# a few scope-part words. Stripped from every brand's distinctive-term table so
+# what remains is mount vocabulary. Mount-relevant tokens (moa, mil, mrad, 20moa,
+# 30mm/34mm/35mm, arca, picatinny, cant) are deliberately NOT listed here.
+# Edit freely -- this is a denylist of noise, not part of the study taxonomy.
+ADJACENT_PRODUCTS = set("""
+atacr nx8 nxs nxr shv beast ataccr
+vortex razor viper pst athlon cronus midas ares helos argos talos
+arken swfa burris xtr veracity signature bushnell match-pro dmr
+sig tango whiskey sierra steiner march kahles schmidt s&b pmii zco tangent theta
+trijicon acog credo huron tenmile ventus eotech vudu maven riton monstrum
+aimpoint holosun romeo delta stryker leupold-mark mark5 mk5 vx3 vx5 vx6 hamr
+harris atlas ckye ckyepod accutac magpod tacpod talon talons
+triggertech timney hellfire jewell
+mdt magpul aics archangel krg manners mcmillan grayboe foundation xlr
+tikka bergara defiance terminus zermatt bighorn curtis kelbly mausingfield borden
+savage howa ruger remington rem 700 m1a ar15 ar10 ar47 mk12
+creedmoor grendel prc arc nato
+glass reticle illumination turret turrets parallax magnification objective
+area419 arc419 nrl prs precisionrifle
+""".split())
+
+
+def add_adjacent_products(words):
+    """Extend the adjacent-product denylist at runtime (lowercased tokens)."""
+    ADJACENT_PRODUCTS.update(w.lower() for w in words)
+
 
 def window_text(full):
     """Keep only the sentence(s) containing a brand mention plus one sentence on
@@ -840,8 +889,13 @@ def ngrams(tokens, nmax=3):
 
 
 def _ok_term(term):
-    # drop any n-gram containing a brand/product token
-    return not any(t in BRAND_TOKENS for t in term.split())
+    # drop any n-gram containing a brand name, product name, or scope-model token
+    toks = term.split()
+    if any(t in BRAND_TOKENS for t in toks):
+        return False
+    if any(t in ADJACENT_PRODUCTS for t in toks):
+        return False
+    return True
 
 
 def distinctive_ngrams(group_docs, rest_docs, alpha0=1000.0, top=15, min_docs=3):

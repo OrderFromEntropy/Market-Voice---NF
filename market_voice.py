@@ -1724,10 +1724,12 @@ _Pull from findings_candidates.md -- it ranks only cells with >= {min_support} d
 3. TODO -- <third finding>
 
 ## One limitation, named unprompted
-TODO -- Sentiment runs heavily positive across every brand (see
-sentiment_distribution.csv): this is a self-selected enthusiast sample -- people
-who bought a mount and like it. Compare brands relative to each other, not against
-zero; pair with a returns/warranty dataset before drawing absolute conclusions.
+TODO -- Labels come from a local model that agreed with my 50-comment hand audit
+~66% of the time, so I read the DIRECTION and RANKING of cells, not absolute
+values. The model marks most comments neutral (see sentiment_distribution.csv),
+which compresses net-sentiment magnitudes -- brand-to-brand differences matter,
+the decimals do not. The corpus is also self-selected forum/enthusiast voices;
+pair with a returns/warranty dataset before drawing absolute conclusions.
 
 ## How I validated
 I audited my own labels the way I'd audit a build: a stratified 50-row sample

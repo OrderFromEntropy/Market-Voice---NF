@@ -158,6 +158,9 @@ YOUTUBE_QUOTA_BUDGET = 5000
 # Heat-map / verbatim cells with fewer than this many supporting docs are treated
 # as too thin to headline (kept in the matrices, flagged in findings_candidates).
 MIN_CELL_SUPPORT = 10
+# Optional recency cut applied to the corpus before the analysis stages (clouds,
+# analyze, report). Set via the --since YYYY-MM-DD command-line flag. None = no cut.
+SINCE = None
 REDDIT_SOURCE = "pullpush"          # "pullpush" | "direct"
 PULLPUSH_PAGES = 5                  # pages of 100 comments per brand query
 PULLPUSH_SECONDS_BETWEEN = 2.0      # polite pacing for the PullPush archive
@@ -825,6 +828,27 @@ def write_corpus_stats(df):
         dates = [d for d in df["created_utc"] if d]
         if dates:
             lines.append("date range      : %s .. %s" % (min(dates), max(dates)))
+    # commit rates -- how often the model assigns a real attribute rather than "other"
+    classified = df[df["attribute"].isin(ATTRIBUTES)]
+    doc_total = len(classified)
+    doc_commit = int((classified["attribute"] != "other").sum()) if doc_total else 0
+    attr_total = attr_commit = 0
+    for _, r in classified.iterrows():
+        committed = r["attribute"] != "other"
+        for _b in _model_brands(r):
+            attr_total += 1
+            if committed:
+                attr_commit += 1
+    if doc_total:
+        lines.append("document-level attribute commit rate    : %.1f%% (%d/%d)"
+                     % (100.0 * doc_commit / doc_total, doc_commit, doc_total))
+    else:
+        lines.append("document-level attribute commit rate    : n/a (run classify)")
+    if attr_total:
+        lines.append("attribution-level attribute commit rate : %.1f%% (%d/%d)"
+                     % (100.0 * attr_commit / attr_total, attr_commit, attr_total))
+    else:
+        lines.append("attribution-level attribute commit rate : n/a (run classify)")
     txt = "\n".join(lines)
     open(os.path.join(OUT_DIR, "corpus_stats.txt"), "w", encoding="utf-8").write(txt + "\n")
     return txt
@@ -931,6 +955,28 @@ def ngrams(tokens, nmax=3):
     return grams
 
 
+# Per-brand alias matcher (used to require a quote actually names its brand).
+BRAND_ALIAS_RE = {b: re.compile("|".join(
+    r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])" for a in al))
+    for b, al in BRANDS.items()}
+
+
+def text_has_brand_alias(text, brand):
+    return bool(BRAND_ALIAS_RE[brand].search((text or "").lower()))
+
+
+def _apply_since(df):
+    """Filter a corpus DataFrame to created_utc >= SINCE (a YYYY-MM-DD string).
+    Undated rows are dropped when a cut is active. No-op when SINCE is None."""
+    if not SINCE:
+        return df
+    before = len(df)
+    kept = df[df["created_utc"].astype(str) >= SINCE].copy()
+    log("[since] recency cut created_utc >= %s : %d -> %d docs"
+        % (SINCE, before, len(kept)))
+    return kept
+
+
 def _ok_term(term):
     # drop any n-gram containing a brand name, product name, or scope-model token
     toks = term.split()
@@ -994,6 +1040,7 @@ def stage_clouds():
     if not os.path.exists(CORPUS_CSV):
         stage_corpus()
     df = pd.read_csv(CORPUS_CSV).fillna("")
+    df = _apply_since(df)
     if df.empty:
         log("[terms] corpus is empty -- nothing to analyze.")
         return
@@ -1366,27 +1413,39 @@ def _write_matrix_csv(mat, path, brands, attrs):
     log("[analyze] wrote %s" % path)
 
 
-def _heatmap(mat, brands, attrs, title, path, cmap, center_zero=False, fmt="%.0f"):
+def _heatmap(mat, brands, attrs, title, path, cmap, support=None, gate=0,
+             center_zero=False, fmt="%.0f"):
+    """Cells with support < gate are masked gray and labeled 'n<10'; every valid
+    cell is annotated with its value and (n=X)."""
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     M = np.array([[float(mat.get(b, {}).get(a, 0)) for a in attrs] for b in brands])
-    plt.figure(figsize=(max(8, len(attrs) * 0.9), max(4, len(brands) * 0.6)))
+    N = np.array([[int(support.get(b, {}).get(a, 0)) if support else 10 ** 9
+                   for a in attrs] for b in brands])
+    masked = N < gate
+    Mm = np.ma.masked_where(masked, M)
+    base = plt.get_cmap(cmap).copy()
+    base.set_bad("lightgray")
+    plt.figure(figsize=(max(9, len(attrs) * 1.05), max(4, len(brands) * 0.65)))
     if center_zero:
-        lim = max(1e-6, np.abs(M).max())
-        im = plt.imshow(M, cmap=cmap, vmin=-lim, vmax=lim, aspect="auto")
+        valid = M[~masked]
+        lim = max(1e-6, np.abs(valid).max() if valid.size else 1.0)
+        im = plt.imshow(Mm, cmap=base, vmin=-lim, vmax=lim, aspect="auto")
     else:
-        im = plt.imshow(M, cmap=cmap, aspect="auto")
+        im = plt.imshow(Mm, cmap=base, aspect="auto")
     plt.colorbar(im, fraction=0.046, pad=0.04)
     plt.xticks(range(len(attrs)), attrs, rotation=45, ha="right", fontsize=8)
     plt.yticks(range(len(brands)), brands, fontsize=9)
     for i in range(len(brands)):
         for j in range(len(attrs)):
-            v = M[i, j]
-            if abs(v) > 1e-9:
-                plt.text(j, i, fmt % v, ha="center", va="center", fontsize=7,
-                         color="black")
+            if masked[i, j]:
+                plt.text(j, i, "n<10", ha="center", va="center", fontsize=6,
+                         color="dimgray")
+            else:
+                plt.text(j, i, (fmt % M[i, j]) + "\n(n=%d)" % N[i, j],
+                         ha="center", va="center", fontsize=6, color="black")
     plt.title(title, fontsize=13)
     plt.tight_layout()
     plt.savefig(path, dpi=120)
@@ -1400,6 +1459,7 @@ def stage_analyze():
         stage_corpus()
     _merge_labels_into_corpus()   # ensure model labels (incl. model_brands) are synced
     df = pd.read_csv(CORPUS_CSV).fillna("")
+    df = _apply_since(df)
     labeled = df[df["attribute"].isin(ATTRIBUTES)]
     if labeled.empty:
         log("[analyze] no classified rows yet -- run the 'classify' stage first.")
@@ -1413,11 +1473,12 @@ def stage_analyze():
     for b in mention:
         for a in mention[b]:
             share[b][a] = mention[b][a] / grand
-    _heatmap(share, brands, attrs, "Mention share (brand x attribute)",
-             os.path.join(OUT_DIR, "heat_mention_share.png"), "Blues", fmt="%.2f")
-    _heatmap(net, brands, attrs, "Net sentiment (pos-neg)/total",
+    _heatmap(share, brands, attrs, "Mention share (brand x attribute, n>=%d)" % MIN_CELL_SUPPORT,
+             os.path.join(OUT_DIR, "heat_mention_share.png"), "Blues",
+             support=tot, gate=MIN_CELL_SUPPORT, fmt="%.2f")
+    _heatmap(net, brands, attrs, "Net sentiment (pos-neg)/total, n>=%d" % MIN_CELL_SUPPORT,
              os.path.join(OUT_DIR, "heat_net_sentiment.png"), "RdYlGn",
-             center_zero=True, fmt="%.2f")
+             support=tot, gate=MIN_CELL_SUPPORT, center_zero=True, fmt="%.2f")
     # overall matrices as CSV (counts, net sentiment, support) -- easy to read/cite
     _write_matrix_csv(mention, os.path.join(OUT_DIR, "mention_counts_all.csv"), brands, attrs)
     _write_matrix_csv(net, os.path.join(OUT_DIR, "net_sentiment_all.csv"), brands, attrs)
@@ -1571,10 +1632,16 @@ def stage_report():
         stage_corpus()
     _merge_labels_into_corpus()   # ensure model labels (incl. model_brands) are synced
     df = pd.read_csv(CORPUS_CSV).fillna("")
+    df = _apply_since(df)
     labeled = df[df["attribute"].isin(ATTRIBUTES)]
 
-    def _has_brand(r, b):
-        return b in _model_brands(r)
+    # Verbatim eligibility: the comment must be about EXACTLY ONE study brand (per
+    # the model) AND its text must actually name that brand.
+    def _eligible(r, b):
+        mb = _model_brands(r)
+        if len(mb) != 1 or mb[0] != b:
+            return False
+        return text_has_brand_alias(str(r.get("window") or r["text"]), b)
 
     # ---- verbatims.md : best quotable comments per notable (robust) cell ----
     notable = []
@@ -1583,12 +1650,16 @@ def stage_report():
         cells.sort(key=lambda c: (abs(c[2]), c[3]), reverse=True)
         notable = cells[:12]
     lines = ["# Verbatims -- best quotable comments per notable cell",
-             "_Cells with >= %d docs; brand = the model's judgment of what the "
-             "comment is about; snippet is the windowed text._\n" % MIN_CELL_SUPPORT]
+             "",
+             "**HAND-VERIFY EVERY QUOTE AT ITS LINK**",
+             "",
+             "_Cells with >= %d docs. A quote is eligible only if the model judged the "
+             "comment to be about exactly one study brand AND the text names that "
+             "brand; snippet is the windowed text._\n" % MIN_CELL_SUPPORT]
     for b, a, netval, t in notable:
         lines.append("## %s / %s   (net sentiment %+.2f over %d docs)\n" % (b, a, netval, t))
         sub = labeled[(labeled["attribute"] == a)
-                      & labeled.apply(lambda r: _has_brand(r, b), axis=1)]
+                      & labeled.apply(lambda r: _eligible(r, b), axis=1)]
         q = sub[sub["quotable"].astype(str).str.lower().isin(["true", "1"])]
         pick = q if not q.empty else sub
         for _, r in pick.head(5).iterrows():
@@ -1801,14 +1872,30 @@ def run_stage(stage):
 
 
 def main():
+    global SINCE
     stage = STAGE
-    if len(sys.argv) > 1:
-        stage = sys.argv[1].strip().lower()
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--since":
+            i += 1
+            if i < len(args):
+                SINCE = args[i].strip()
+        elif a.startswith("--since="):
+            SINCE = a.split("=", 1)[1].strip()
+        elif not a.startswith("-"):
+            stage = a.strip().lower()
+        i += 1
+    if SINCE and not re.match(r"^\d{4}-\d{2}-\d{2}$", SINCE):
+        log("--since must be YYYY-MM-DD; got %r" % SINCE)
+        return
     valid = {"collect", "corpus", "clouds", "classify", "analyze", "report", "all"}
     if stage not in valid:
         log("Unknown stage %r. Choose one of: %s" % (stage, ", ".join(sorted(valid))))
         return
-    log("=== Nightforce Market Voice :: stage = %s ===" % stage)
+    log("=== Nightforce Market Voice :: stage = %s%s ==="
+        % (stage, (" since=%s" % SINCE) if SINCE else ""))
     run_stage(stage)
     log("=== done (stage = %s) ===" % stage)
 

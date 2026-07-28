@@ -828,17 +828,20 @@ def write_corpus_stats(df):
         dates = [d for d in df["created_utc"] if d]
         if dates:
             lines.append("date range      : %s .. %s" % (min(dates), max(dates)))
-    # commit rates -- how often the model assigns a real attribute rather than "other"
-    classified = df[df["attribute"].isin(ATTRIBUTES)]
-    doc_total = len(classified)
-    doc_commit = int((classified["attribute"] != "other").sum()) if doc_total else 0
+    # commit rates -- how often the model assigns a real attribute rather than
+    # "other" (matches the audit / stats_update.txt: denominator = mounts docs).
+    mounts = df[df["bucket"] == "mounts"]
+    has_labels = mounts["attribute"].isin(ATTRIBUTES).any() if len(mounts) else False
+    doc_total = len(mounts) if has_labels else 0
+    doc_commit = int((mounts["attribute"] != "other").sum()) if has_labels else 0
     attr_total = attr_commit = 0
-    for _, r in classified.iterrows():
-        committed = r["attribute"] != "other"
-        for _b in _model_brands(r):
-            attr_total += 1
-            if committed:
-                attr_commit += 1
+    if has_labels:
+        for _, r in mounts.iterrows():
+            committed = r["attribute"] != "other"
+            for _b in _model_brands(r):
+                attr_total += 1
+                if committed:
+                    attr_commit += 1
     if doc_total:
         lines.append("document-level attribute commit rate    : %.1f%% (%d/%d)"
                      % (100.0 * doc_commit / doc_total, doc_commit, doc_total))
@@ -1823,6 +1826,189 @@ separately for attribute and sentiment. TODO -- <insert the two agreement number
 
 
 # ============================================================================
+#  STAGE 7  AUDIT -- faithful port of fix_outputs.py (audit-consistent artifacts)
+# ============================================================================
+# Expanded alias set for the audit's single-brand quote check. Substring match on
+# a space-padded lowercased window (so "nf ", "c1 ", "aus " match as tokens).
+AUDIT_ALIAS = {
+    "nightforce": ["nightforce", "night force", "unimount", "uni-mount", "magmount",
+                   "mag mount", "x-treme duty", "xtreme duty", "ultralite", "ultramount", "nf "],
+    "leupold": ["leupold", "leopold", "luepold", "lupold", "backcountry", "mark ar"],
+    "reptilia": ["reptilia", "reptillia", "reptila", "aus "],
+    "badger_ordnance": ["badger", "condition one", "c1 "],
+    "spuhr": ["spuhr", "sphur"],
+    "geissele": ["geissele", "geiselle", "giselle", "gieselle", "super precision"],
+    "warne": ["warne", "mountain tech", "skyline"],
+}
+
+
+def stage_audit():
+    """Reproduce the fix_outputs.py reference artifacts from corpus.csv:
+    verbatims_clean.md, heat_{net_sentiment,mention_share}_gated.png,
+    stats_update.txt, nf_other_sample.csv, recency_summary.txt, and the 24-month
+    matrices. Self-contained: reads the full mounts corpus and applies its own
+    recency cutoff (SINCE if given, else 2024-07-24)."""
+    import pandas as pd
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    brands = list(BRANDS.keys())
+    attrs = list(ATTRIBUTES)
+    gate = MIN_CELL_SUPPORT
+    cutoff = SINCE or "2024-07-24"
+
+    if not os.path.exists(CORPUS_CSV):
+        stage_corpus()
+    _merge_labels_into_corpus()
+    df = pd.read_csv(CORPUS_CSV)
+    df = df[df["bucket"] == "mounts"].copy()
+    df["model_brands"] = df["model_brands"].fillna("")
+    df["window"] = df["window"].fillna(df["text"]).astype(str)
+    df["blist"] = df["model_brands"].apply(lambda s: [b for b in str(s).split("|") if b in brands])
+    df["n_brands"] = df["blist"].apply(len)
+
+    # ---- 1. commit rates ----
+    doc_total = len(df)
+    doc_committed = int((df["attribute"] != "other").sum())
+    attrib = df.explode("blist").dropna(subset=["blist"])
+    att_total = len(attrib)
+    att_committed = int((attrib["attribute"] != "other").sum())
+    per_brand_other = (attrib.groupby("blist")["attribute"]
+                       .apply(lambda s: (s == "other").mean()).round(3))
+
+    # ---- matrices (attribution-level over model brands) ----
+    def matrices(frame):
+        a = frame.explode("blist").dropna(subset=["blist"])
+        cnt = (a.pivot_table(index="blist", columns="attribute", values="id", aggfunc="count")
+               .reindex(index=brands, columns=attrs).fillna(0).astype(int))
+        grp = a.groupby(["blist", "attribute"])["sentiment"]
+        pos = grp.apply(lambda s: (s == "positive").sum())
+        neg = grp.apply(lambda s: (s == "negative").sum())
+        n = a.groupby(["blist", "attribute"]).size()
+        ns = ((pos - neg) / n).round(2).unstack().reindex(index=brands, columns=attrs)
+        return cnt, ns
+
+    cnt_all, ns_all = matrices(df)
+
+    # ---- 2. Nightforce 'other' sample ----
+    nf_other = attrib[(attrib["blist"] == "nightforce") & (attrib["attribute"] == "other")]
+    (nf_other.sample(min(20, len(nf_other)), random_state=7)[["window", "url", "sentiment"]]
+     .to_csv(os.path.join(OUT_DIR, "nf_other_sample.csv"), index=False))
+
+    # ---- 3. clean verbatims (single-brand docs, alias-confirmed) ----
+    def has_alias(text, brand):
+        t = " " + str(text).lower() + " "
+        return any(a in t for a in AUDIT_ALIAS[brand])
+    singles = df[df["n_brands"] == 1].copy()
+    singles["brand"] = singles["blist"].str[0]
+    singles = singles[singles.apply(lambda r: has_alias(r["window"], r["brand"]), axis=1)]
+    lines = ["# Verbatims (single-brand docs only) — HAND-VERIFY EVERY QUOTE AT ITS LINK BEFORE SHARING\n"]
+    for b in brands:
+        for at in attrs[:-1]:   # skip "other"
+            n = int(cnt_all.loc[b, at])
+            if n < gate:
+                continue
+            cell = singles[(singles["brand"] == b) & (singles["attribute"] == at)].copy()
+            if cell.empty:
+                continue
+            cell["pref"] = (cell["quotable"] == True).astype(int) * 2 + (cell["sentiment"] != "neutral").astype(int)
+            cell["lenfit"] = -abs(cell["window"].str.len() - 180)
+            cell = cell.sort_values(["pref", "lenfit"], ascending=False).drop_duplicates("url").head(5)
+            ns_v = ns_all.loc[b, at]
+            lines.append("\n## %s / %s   (net %+.2f, n=%d)" % (b, at, ns_v, n))
+            for _, r in cell.iterrows():
+                q = re.sub(r"\s+", " ", str(r["window"]))[:280]
+                lines.append('- "%s"\n  <%s>  (%s, %s)' % (q, r["url"], r["source"], r["sentiment"]))
+    open(os.path.join(OUT_DIR, "verbatims_clean.md"), "w", encoding="utf-8").write("\n".join(lines))
+    log("[audit] wrote outputs/verbatims_clean.md")
+
+    # ---- 4. gated heat maps ----
+    def heat(cnt, ns, mode, fname, title):
+        vals = ns if mode == "net" else cnt.div(cnt.sum(axis=1), axis=0)
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        data = vals.values.astype(float)
+        mask = cnt.values < gate
+        show = np.ma.masked_where(mask, data)
+        cmap = (plt.cm.RdYlGn if mode == "net" else plt.cm.Blues).copy()
+        cmap.set_bad("#d9d9d9")
+        vmin, vmax = (-1, 1) if mode == "net" else (0, np.nanmax(np.where(mask, np.nan, data)))
+        im = ax.imshow(show, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(len(attrs))); ax.set_xticklabels(attrs, rotation=40, ha="right")
+        ax.set_yticks(range(len(brands))); ax.set_yticklabels(brands)
+        for i in range(len(brands)):
+            for j in range(len(attrs)):
+                n = int(cnt.values[i, j])
+                if mask[i, j]:
+                    ax.text(j, i, "n<%d" % gate, ha="center", va="center", fontsize=7, color="#777777")
+                else:
+                    v = data[i, j]
+                    s = ("%+.2f\n(n=%d)" % (v, n)) if mode == "net" else ("%.0f%%\n(n=%d)" % (v * 100, n))
+                    ax.text(j, i, s, ha="center", va="center", fontsize=8)
+        ax.set_title(title, fontsize=13)
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.tight_layout(); fig.savefig(os.path.join(OUT_DIR, fname), dpi=150); plt.close(fig)
+        log("[audit] wrote outputs/%s" % fname)
+
+    heat(cnt_all, ns_all, "net", "heat_net_sentiment_gated.png",
+         "Net sentiment (pos-neg)/total — cells under n=%d masked" % gate)
+    heat(cnt_all, ns_all, "share", "heat_mention_share_gated.png",
+         "Share of each brand's mentions by attribute — cells under n=%d masked" % gate)
+
+    # ---- 5. recency check ----
+    rec = df[df["created_utc"].astype(str) >= cutoff]
+    cnt_r, ns_r = matrices(rec)
+    cnt_r.to_csv(os.path.join(OUT_DIR, "mention_counts_24mo.csv"))
+    ns_r.round(2).to_csv(os.path.join(OUT_DIR, "net_sentiment_24mo.csv"))
+
+    def realattr_totals(cnt):
+        return cnt.drop(columns=["other"]).sum(axis=0).sort_values(ascending=False)
+    tot_all, tot_r = realattr_totals(cnt_all), realattr_totals(cnt_r)
+    f1 = tot_r.index[0] == "fit_and_install" if len(tot_r) else None
+    if (len(cnt_r) and cnt_r.loc["warne", "price_value"] >= gate
+            and cnt_r.loc["nightforce", "price_value"] >= gate):
+        f2 = (ns_r.loc["warne", "price_value"] > 0.25) and (
+            ns_r.loc["warne", "price_value"] > ns_r.loc["nightforce", "price_value"])
+    else:
+        f2 = None
+    bq = []
+    for b in brands:
+        row = ns_r.loc[b][[a for a in attrs[:-1] if cnt_r.loc[b, a] >= gate]] if len(cnt_r) else []
+        if len(row):
+            bq.append(row.idxmax() == "build_quality")
+    f3 = (sum(bq) >= max(1, len(bq) // 2 + 1)) if bq else None
+    verdict = {True: "HOLDS", False: "FLIPS", None: "UNDER-SUPPORTED"}
+    with open(os.path.join(OUT_DIR, "recency_summary.txt"), "w", encoding="utf-8") as f:
+        f.write("RECENCY CHECK — docs from %s on\n" % cutoff)
+        f.write("24mo corpus: %d of %d docs (%.0f%%)\n\n"
+                % (len(rec), doc_total, 100.0 * len(rec) / doc_total if doc_total else 0))
+        f.write("Finding 1 (fitment is biggest real attribute): "
+                + ("HOLDS" if f1 else "FLIPS") + "  | 24mo totals: %s\n" % tot_r.to_dict())
+        f.write("Finding 2 (Warne value anchor > NF on price): " + verdict[f2]
+                + " | warne %s (n=%d), nf %s (n=%d)\n"
+                % (ns_r.loc["warne", "price_value"] if len(cnt_r) else float("nan"),
+                   int(cnt_r.loc["warne", "price_value"]) if len(cnt_r) else 0,
+                   ns_r.loc["nightforce", "price_value"] if len(cnt_r) else float("nan"),
+                   int(cnt_r.loc["nightforce", "price_value"]) if len(cnt_r) else 0))
+        f.write("Finding 3 (build quality most-positive per brand): " + verdict[f3]
+                + " | brands where true: %d/%d\n" % (sum(bq), len(bq)))
+    log("[audit] wrote outputs/recency_summary.txt (+ 24mo matrices)")
+
+    # ---- 6. stats for memo ----
+    with open(os.path.join(OUT_DIR, "stats_update.txt"), "w", encoding="utf-8") as f:
+        f.write("doc-level commit rate      : %d/%d = %.0f%% (other = %.0f%%)\n"
+                % (doc_committed, doc_total, 100.0 * doc_committed / doc_total if doc_total else 0,
+                   100.0 * (1 - doc_committed / doc_total) if doc_total else 0))
+        f.write("attribution-level commit   : %d/%d = %.0f%%\n"
+                % (att_committed, att_total, 100.0 * att_committed / att_total if att_total else 0))
+        f.write("per-brand 'other' share    : " + json.dumps(per_brand_other.to_dict()) + "\n")
+        f.write("24mo subset size           : %d docs (%.0f%% of corpus)\n"
+                % (len(rec), 100.0 * len(rec) / doc_total if doc_total else 0))
+    log("[audit] wrote outputs/stats_update.txt")
+
+
+# ============================================================================
 #  SURPRISING-CELLS PRINTOUT
 # ============================================================================
 def print_surprises():
@@ -1867,6 +2053,10 @@ def run_stage(stage):
         if not check_dependencies(need_plotting=False):
             return
         stage_report()
+    if stage in ("audit", "all"):
+        if not check_dependencies(need_plotting=True):
+            return
+        stage_audit()
     if stage == "all":
         print_surprises()
 
@@ -1890,7 +2080,7 @@ def main():
     if SINCE and not re.match(r"^\d{4}-\d{2}-\d{2}$", SINCE):
         log("--since must be YYYY-MM-DD; got %r" % SINCE)
         return
-    valid = {"collect", "corpus", "clouds", "classify", "analyze", "report", "all"}
+    valid = {"collect", "corpus", "clouds", "classify", "analyze", "report", "audit", "all"}
     if stage not in valid:
         log("Unknown stage %r. Choose one of: %s" % (stage, ", ".join(sorted(valid))))
         return

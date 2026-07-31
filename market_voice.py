@@ -234,12 +234,24 @@ SAMPLE_COMMENTS = [
 # ============================================================================
 # Your installed Ollama model tag. Run `ollama list` to confirm. The script
 # self-checks this on startup and prints your installed tags if it is missing.
-OLLAMA_MODEL = "qwen2.5:14b"
+OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_URL = "http://localhost:11434"
 # Classification prompts are short (a windowed comment + examples ~ under 1500
 # tokens), so a small context window is plenty -- and a smaller window frees VRAM,
-# letting more of a 14B model sit on the GPU instead of spilling to CPU.
-OLLAMA_NUM_CTX = 2048
+# letting the model sit fully on the GPU instead of spilling to CPU.
+OLLAMA_NUM_CTX = 4096
+
+# --- Accuracy levers (see the classify stage) ---
+# Two-pass: attribute and sentiment are classified in SEPARATE focused calls.
+# Self-consistency: each pass is sampled N times at a small temperature and the
+# majority label wins (set to 1 to disable -> 1 deterministic call per pass).
+SELF_CONSISTENCY_SAMPLES = 3
+SELF_CONSISTENCY_TEMP = 0.3
+# Gold few-shot: hand-labeled rows from outputs/validation_sample.csv are injected
+# into the prompts (prioritizing the ones the model got wrong). Those rows are then
+# HELD OUT of any freshly generated validation sample, so re-measuring stays honest.
+GOLD_FEWSHOT = True
+MAX_GOLD_FEWSHOT = 12
 
 # Paste your YouTube Data API key here to hard-wire it (optional). If left blank,
 # the script looks for YT_API_KEY in the environment, then a .env file next to
@@ -1241,45 +1253,192 @@ VALID_SENT = {"positive", "negative", "neutral", "mixed"}
 VALID_BRANDS = set(BRANDS) | {"other", "none"}
 
 
-def ollama_classify(text):
-    """Return (parsed_dict_or_None, raw_string)."""
-    prompt = CLASSIFY_PROMPT.replace("{comment}", json.dumps(text)[1:-1])
+# --- Two focused prompts (two-pass): one for what the comment is ABOUT, one for
+#     how the commenter FEELS. Both carry tightened definitions on the boundary
+#     that drives most attribute errors (build_quality vs fit_and_install), plus a
+#     {gold} slot for hand-labeled examples. JSON braces are literal -> use
+#     .replace(), never .format().
+ATTR_PROMPT = """You label WHAT a short comment about riflescope MOUNTS/rings/bases is about.
+Return ONLY JSON: {"brands": [...], "attribute": "<one>", "quotable": true or false}
+brands = zero or more of: nightforce, leupold, reptilia, badger_ordnance, spuhr, geissele, warne, other, none.
+attribute = exactly one of: zero_retention, build_quality, weight, price_value, fit_and_install, availability_and_service, other.
+
+- zero_retention: holding/returning to zero, repeatability, QD lockup, zero shift after remounting.
+- build_quality: the mount's INTRINSIC make once you own it -- materials, machining, finish, how solid/"tank"-like it feels, whether it breaks or holds up.
+- weight: how heavy or light the mount is.
+- price_value: cost, worth, expensive/cheap, value for money.
+- fit_and_install: getting it ONTO a rifle/optic -- ring height, objective clearance, cantilever/offset, torque, leveling, WHAT FITS WHAT, ease or hassle of installing.
+- availability_and_service: in stock / lead time / where to buy, customer service, warranty, returns.
+- other: anything else, or too vague (general questions, build lists, chit-chat).
+
+CRITICAL boundary, build_quality vs fit_and_install:
+- Is it about how WELL-MADE or DURABLE the mount is (materials, machining, "tank", "solid", "broke")? -> build_quality.
+- Is it about MOUNTING/SETUP or COMPATIBILITY (height, clearance, offset, torque, "fits my", "install")? -> fit_and_install.
+- "machined beautifully, rock solid" -> build_quality. "needed high rings to clear a 56mm" -> fit_and_install.
+
+quotable = true only if vivid, specific, under about 60 words.
+{gold}
+Comment: "The Spuhr is machined beautifully, feels milled from one billet, super solid."
+{"brands": ["spuhr"], "attribute": "build_quality", "quotable": true}
+
+Comment: "Had to run high rings on the Warne to clear my 56mm objective, install was easy though."
+{"brands": ["warne"], "attribute": "fit_and_install", "quotable": true}
+
+Comment: "Badger C1 is an absolute tank, dropped it on concrete and it shrugged it off."
+{"brands": ["badger_ordnance"], "attribute": "build_quality", "quotable": true}
+
+Comment: "What height Nightforce rings do I need for a 34mm tube on a Tikka?"
+{"brands": ["nightforce"], "attribute": "fit_and_install", "quotable": false}
+
+Comment: {comment}
+"""
+
+SENT_PROMPT = """You judge the commenter's SENTIMENT toward the riflescope MOUNT.
+Return ONLY JSON: {"sentiment": "<one>"} where one of: positive, negative, neutral, mixed.
+- positive: praise, recommendation, satisfaction.
+- negative: complaint, regret, failure, OR sarcasm masking a complaint ("only lost zero twice, great value" = negative).
+- neutral: a plain fact, spec, or question with no clear stance toward the mount.
+- mixed: a clear PRO and a clear CON about the mount together ("great mount but heavy").
+Use mixed ONLY when both a pro and a con are present; a merely factual comment is neutral, not mixed.
+The comment is mainly about: {attribute}.
+{gold}
+Comment: "Love my Spuhr, rock solid, worth every penny."
+{"sentiment": "positive"}
+
+Comment: "The badger is a tank but way too heavy for a hunting rig."
+{"sentiment": "mixed"}
+
+Comment: "my warne only lost zero twice this season, great value lol"
+{"sentiment": "negative"}
+
+Comment: "I run a Warne 30mm one-piece on my 700."
+{"sentiment": "neutral"}
+
+Comment: {comment}
+"""
+
+
+def _ollama_generate(prompt, temperature):
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-               "format": "json", "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX}}
+               "format": "json", "options": {"temperature": temperature, "num_ctx": OLLAMA_NUM_CTX}}
     try:
         r = requests.post(OLLAMA_URL + "/api/generate", json=payload, timeout=120)
-    except Exception as e:
-        return None, "REQUEST_ERROR: %s" % e
+    except Exception:
+        return None
     if r.status_code != 200:
-        return None, "HTTP %s" % r.status_code
-    raw = r.json().get("response", "")
-    parsed = _parse_label(raw)
-    return parsed, raw
+        return None
+    return r.json().get("response", "")
 
 
-def _parse_label(raw):
+def _safe_json(raw):
+    if not raw:
+        return None
     try:
-        obj = json.loads(raw)
+        return json.loads(raw)
     except Exception:
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
             return None
         try:
-            obj = json.loads(m.group(0))
+            return json.loads(m.group(0))
         except Exception:
             return None
-    if not isinstance(obj, dict):
+
+
+def _samples_and_temp():
+    n = max(1, SELF_CONSISTENCY_SAMPLES)
+    return n, (0.0 if n == 1 else SELF_CONSISTENCY_TEMP)
+
+
+def classify_attribute(text, gold=""):
+    """Self-consistency vote over the attribute pass. Returns dict or None."""
+    prompt = ATTR_PROMPT.replace("{gold}", gold).replace("{comment}", json.dumps(text)[1:-1])
+    n, temp = _samples_and_temp()
+    attr_votes, brand_votes, quot_votes = Counter(), Counter(), []
+    for _ in range(n):
+        obj = _safe_json(_ollama_generate(prompt, temp))
+        if not isinstance(obj, dict):
+            continue
+        a = obj.get("attribute")
+        if a in ATTRIBUTES:
+            attr_votes[a] += 1
+        b = obj.get("brands")
+        if isinstance(b, list):
+            brand_votes[tuple(sorted(x for x in b if x in VALID_BRANDS))] += 1
+        quot_votes.append(bool(obj.get("quotable", False)))
+    if not attr_votes:
         return None
-    attr = obj.get("attribute")
-    sent = obj.get("sentiment")
-    brands = obj.get("brands")
-    if attr not in ATTRIBUTES or sent not in VALID_SENT:
-        return None
-    if not isinstance(brands, list):
-        return None
-    brands = [b for b in brands if b in VALID_BRANDS]
-    return {"brands": brands, "attribute": attr, "sentiment": sent,
-            "quotable": bool(obj.get("quotable", False))}
+    brands = list(brand_votes.most_common(1)[0][0]) if brand_votes else []
+    quotable = (sum(quot_votes) > len(quot_votes) / 2) if quot_votes else False
+    return {"attribute": attr_votes.most_common(1)[0][0], "brands": brands, "quotable": quotable}
+
+
+def classify_sentiment(text, attribute, gold=""):
+    """Self-consistency vote over the sentiment pass. Returns label or None."""
+    prompt = (SENT_PROMPT.replace("{gold}", gold).replace("{attribute}", attribute)
+              .replace("{comment}", json.dumps(text)[1:-1]))
+    n, temp = _samples_and_temp()
+    votes = Counter()
+    for _ in range(n):
+        obj = _safe_json(_ollama_generate(prompt, temp))
+        if isinstance(obj, dict) and obj.get("sentiment") in VALID_SENT:
+            votes[obj["sentiment"]] += 1
+    return votes.most_common(1)[0][0] if votes else None
+
+
+def ollama_classify(text, attr_gold="", sent_gold=""):
+    """Two-pass classify with self-consistency. Returns (parsed_dict_or_None, status)."""
+    a = classify_attribute(text, attr_gold)
+    if a is None:
+        return None, "attribute pass failed"
+    s = classify_sentiment(text, a["attribute"], sent_gold)
+    if s is None:
+        return None, "sentiment pass failed"
+    return {"brands": a["brands"], "attribute": a["attribute"],
+            "sentiment": s, "quotable": a["quotable"]}, "ok"
+
+
+def build_gold_fewshot():
+    """Load hand-labeled rows from validation_sample.csv, prioritizing the ones the
+    model got wrong, and format them as few-shot blocks. Records the used doc ids
+    (cache/gold_ids.json) so a fresh validation sample can hold them out."""
+    if not GOLD_FEWSHOT:
+        return "", "", set()
+    vpath = os.path.join(OUT_DIR, "validation_sample.csv")
+    if not os.path.exists(vpath):
+        log("[classify] no labeled validation_sample.csv -> running without gold few-shot.")
+        return "", "", set()
+    rows = list(csv.DictReader(open(vpath, encoding="utf-8")))
+
+    def clean(s):
+        return re.sub(r"\s+", " ", str(s)).strip()[:200]
+
+    a_rows = [r for r in rows if (r.get("human_attribute") or "").strip() in ATTRIBUTES]
+    s_rows = [r for r in rows if (r.get("human_sentiment") or "").strip() in VALID_SENT]
+    a_rows.sort(key=lambda r: 0 if (r.get("human_attribute", "").strip()
+                                    != r.get("model_attribute", "").strip()) else 1)
+    s_rows.sort(key=lambda r: 0 if (r.get("human_sentiment", "").strip()
+                                    != r.get("model_sentiment", "").strip()) else 1)
+    a_ex, s_ex = a_rows[:MAX_GOLD_FEWSHOT], s_rows[:MAX_GOLD_FEWSHOT]
+    used = set(r.get("id", "") for r in a_ex) | set(r.get("id", "") for r in s_ex)
+    used.discard("")
+
+    attr_gold = ""
+    if a_ex:
+        attr_gold = ("Examples I hand-labeled -- match this judgement:\n"
+                     + "\n\n".join('Comment: "%s"\n{"attribute": "%s"}'
+                                   % (clean(r["text"]), r["human_attribute"].strip())
+                                   for r in a_ex) + "\n")
+    sent_gold = ""
+    if s_ex:
+        sent_gold = ("Examples I hand-labeled -- match this judgement:\n"
+                     + "\n\n".join('Comment: "%s"\n{"sentiment": "%s"}'
+                                   % (clean(r["text"]), r["human_sentiment"].strip())
+                                   for r in s_ex) + "\n")
+    json.dump(sorted(used), open(os.path.join(CACHE_DIR, "gold_ids.json"), "w"))
+    log("[classify] gold few-shot: %d attribute + %d sentiment examples; %d docs "
+        "held out of future validation." % (len(a_ex), len(s_ex), len(used)))
+    return attr_gold, sent_gold, used
 
 
 CLASSIFIED_FIELDS = ["id", "brands", "attribute", "sentiment", "quotable", "status", "model_raw"]
@@ -1310,16 +1469,19 @@ def stage_classify():
         w.writeheader()
     total = len(targets)
     todo = [r for _, r in targets.iterrows() if r["id"] not in done]
-    log("[classify] %d mounts-bucket docs; %d already done; %d to classify."
-        % (total, total - len(todo), len(todo)))
+    attr_gold, sent_gold, _gold_ids = build_gold_fewshot()
+    n, _ = _samples_and_temp()
+    log("[classify] %d mounts-bucket docs; %d already done; %d to classify "
+        "(model=%s, two-pass, %d-vote)."
+        % (total, total - len(todo), len(todo), OLLAMA_MODEL, n))
     n_ok = n_bad = 0
     t0 = time.time()
     for i, r in enumerate(todo, 1):
         # classification runs on the windowed text, not the full comment
         text = str(r["window"]).strip() or str(r["text"])
-        parsed, raw = ollama_classify(text)
+        parsed, raw = ollama_classify(text, attr_gold, sent_gold)
         if parsed is None:  # retry once
-            parsed, raw = ollama_classify(text)
+            parsed, raw = ollama_classify(text, attr_gold, sent_gold)
         if parsed is None:
             n_bad += 1
             w.writerow({"id": r["id"], "brands": "", "attribute": "", "sentiment": "",
@@ -1734,6 +1896,17 @@ def _write_validation_sample(labeled):
             "human_attribute,human_sentiment\n")
         log("[report] wrote empty validation_sample.csv (nothing classified yet)")
         return
+    # hold out any docs used as gold few-shot, so re-measurement isn't leaked
+    gp = os.path.join(CACHE_DIR, "gold_ids.json")
+    if os.path.exists(gp):
+        try:
+            gold_ids = set(json.load(open(gp)))
+        except Exception:
+            gold_ids = set()
+        if gold_ids:
+            labeled = labeled[~labeled["id"].isin(gold_ids)]
+            log("[report] held out %d gold few-shot docs from the validation sample."
+                % len(gold_ids))
     # stratify across brand x sentiment (brand = model's judgment)
     buckets = defaultdict(list)
     for _, r in labeled.iterrows():
